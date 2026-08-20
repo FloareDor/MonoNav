@@ -252,6 +252,12 @@ def main():
         default=1000,
         help="do not execute motion until this many weighted TSDF surface points exist",
     )
+    parser.add_argument(
+        "--tsdf-local-radius",
+        type=float,
+        default=3.0,
+        help="retain only TSDF voxel blocks within this 3D radius of the camera (m)",
+    )
     args = parser.parse_args()
 
     config = load_config("config.yml")
@@ -299,6 +305,7 @@ def main():
     recovery_direction = 1
     recovery_mode = "none"
     point_count = 0
+    tsdf_block_count = 0
     stop_reason = ""
     flight_started = not args.wait_for_start
 
@@ -358,6 +365,13 @@ def main():
             vbg_wrapper.integration_step(
                 cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR), depth_mm, pose
             )
+            tsdf_block_count, pruned_blocks = vbg_wrapper.prune_outside_radius(
+                pose[:3, 3], args.tsdf_local_radius
+            )
+            if pruned_blocks > 0:
+                print(
+                    f"TSDF local window: blocks={tsdf_block_count}, pruned={pruned_blocks}"
+                )
             fused_frames += 1
 
             transformed_lines = []
@@ -478,6 +492,7 @@ def main():
                 f"primitive={selected_index}/{len(trajectory_lines)-1}  "
                 f"goal={distance_to_goal:.2f} m  clearance={args.min_dist2obs:.2f} m  "
                 f"TSDF={point_count}/{args.min_tsdf_points} pts  map_ready={map_ready}  "
+                f"blocks={tsdf_block_count}  "
                 f"unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
                 f"blocked={should_stop}  recovery={recovery_mode}  "
                 f"stop={stop_reason if mission_complete else 'no'}"
@@ -514,7 +529,7 @@ def main():
                 flight_started = False
             print(
                 f"frame={fused_frames} seq={last_sequence} primitive={selected_index} "
-                f"tsdf_points={point_count} blocked={should_stop} "
+                f"tsdf_points={point_count} tsdf_blocks={tsdf_block_count} blocked={should_stop} "
                 f"zoe={inference_seconds:.3f}s bridge={response}",
                 flush=True,
             )

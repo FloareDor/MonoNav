@@ -45,14 +45,16 @@ class VoxelBlockGrid:
         self.device = device
         self.camera = o3d.camera.PinholeCameraIntrinsic(o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault) # Kinect Intrinsics (default)
         self.depth_intrinsic = o3d.core.Tensor(self.camera.intrinsic_matrix, o3d.core.Dtype.Float64)
+        self.voxel_size = 3.0 / 64
+        self.block_resolution = 1
 
         # Initialize the VoxelBlockGrid
         self.vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight', 'color'),
             attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
             attr_channels=(1, 1, 3),
-            voxel_size=3.0 / 64, # this sets the resolution of the voxel grid
-            block_resolution=1,
+            voxel_size=self.voxel_size, # this sets the resolution of the voxel grid
+            block_resolution=self.block_resolution,
             block_count=50000,
             device=device)
 
@@ -67,6 +69,27 @@ class VoxelBlockGrid:
         color_intrinsic = o3d.core.Tensor(self.camera.intrinsic_matrix, o3d.core.Dtype.Float64)
         self.vbg.integrate(frustum_block_coords, depth, color, self.depth_intrinsic,
                        color_intrinsic, extrinsic, self.depth_scale, self.depth_max, self.trunc_voxel_multiplier)
+
+    def prune_outside_radius(self, center, radius):
+        """Remove voxel blocks outside a local 3D radius to bound GPU memory."""
+        hashmap = self.vbg.hashmap()
+        active_indices = hashmap.active_buf_indices()
+        if len(active_indices) == 0:
+            return 0, 0
+        active_keys = hashmap.key_tensor()[active_indices]
+        keys_numpy = active_keys.cpu().numpy()
+        block_centers = (
+            keys_numpy.astype(np.float64) + 0.5
+        ) * self.voxel_size * self.block_resolution
+        distance_squared = np.sum(
+            (block_centers - np.asarray(center, dtype=np.float64).reshape(1, 3)) ** 2,
+            axis=1,
+        )
+        stale = keys_numpy[distance_squared > float(radius) ** 2]
+        if len(stale) > 0:
+            stale_tensor = o3d.core.Tensor(stale, o3d.core.Dtype.Int32, self.device)
+            hashmap.erase(stale_tensor)
+        return int(hashmap.size()), int(len(stale))
 
 
 """
