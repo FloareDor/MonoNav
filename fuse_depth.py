@@ -28,6 +28,7 @@ from utils.utils import *
 #####################################################################
 
 addPose = True
+auto_capture = os.environ.get("MONONAV_AUTO_CAPTURE", "false").lower() in ("1", "true", "yes")
 
 CONFIG_PATH = "config.yml"
 with open(CONFIG_PATH, "r") as f:
@@ -93,14 +94,23 @@ pcd = vbg.vbg.extract_point_cloud(weight_threshold)
 if addPose:
     pose_lineset = get_poses_lineset(poses)
     visualizer = o3d.visualization.Visualizer()
-    visualizer.create_window()
+    visualizer.create_window(window_name="MonoNav TSDF reconstruction")
     visualizer.add_geometry(pcd.to_legacy())
     visualizer.add_geometry(pose_lineset)
     for pose in poses:
         # Add coordinate frame ( The x, y, z axis will be rendered as red, green, and blue arrows respectively.)
         coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame().scale(0.5, center=(0, 0, 0))
         visualizer.add_geometry(coordinate_frame.transform(pose))
-    visualizer.run()
+    if auto_capture:
+        visualizer.reset_view_point(True)
+        for _ in range(30):
+            visualizer.poll_events()
+            visualizer.update_renderer()
+        capture_path = os.path.join(data_dir, "fusion_view.png")
+        visualizer.capture_screen_image(capture_path, do_render=True)
+        print("Saved reconstruction capture to:", capture_path)
+    else:
+        visualizer.run()
     visualizer.destroy_window()
 else:
     o3d.visualization.draw([pcd])

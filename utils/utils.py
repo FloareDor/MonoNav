@@ -17,7 +17,7 @@ import time
 import cv2 as cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as Rotation
-from scipy.spatial import distance
+from scipy.spatial import cKDTree
 import os
 import open3d as o3d
 import open3d.core as o3c
@@ -271,6 +271,7 @@ def choose_primitive(vbg, camera_position, traj_linesets, goal_position, dist_th
 
     # transfer to cpu for cdist
     voxel_coords_numpy = voxel_coords.cpu().numpy()
+    obstacle_tree = cKDTree(voxel_coords_numpy)
 
     # NOW WE HAVE A FILTERED SET OF VOXELS THAT REPRESENT OBSTACLES
     # NEXT, WE DETERMINE THE BEST TRAJECTORY ACCORDING TO A COST FUNCTION
@@ -285,15 +286,14 @@ def choose_primitive(vbg, camera_position, traj_linesets, goal_position, dist_th
         traj_lineset_copy = copy.deepcopy(traj_linset)
         traj_lineset_copy.transform(camera_position) # transform the lineset (copy) to the camera position
         pts = np.asarray(traj_lineset_copy.points) # meters # extract the points from the lineset
-        tmp = distance.cdist(voxel_coords_numpy, pts, "sqeuclidean") # compute the distance between all voxels and all points in the trajectory
-        voxel_idx, pt_idx = np.unravel_index(np.argmin(tmp), tmp.shape) # extract indices of the nearest voxel to and nearest point in the trajectory
-        nearest_voxel_dist = np.sqrt(tmp[voxel_idx, pt_idx])
+        # Querying a KD-tree gives the same minimum obstacle distance without
+        # materializing the potentially multi-gigabyte voxel-by-point matrix.
+        nearest_voxel_dist = np.min(obstacle_tree.query(pts, k=1)[0])
         if nearest_voxel_dist > dist_threshold:
             # the trajectory meets the dist_threshold criterion
             if goal_position is not None:
                 # the trajectory satisfies the dist_threshold; let's compute the goal score
-                tmp_to_goal = distance.cdist(goal_position, pts, "sqeuclidean")
-                dst_to_goal = np.sqrt(np.min(tmp_to_goal))
+                dst_to_goal = np.min(np.linalg.norm(pts - goal_position, axis=1))
                 if dst_to_goal < min_goal_score:
                     # we have a trajectory that gets us closer to the goal
                     # print("traj %d gets us closer to the goal: %f"%(traj_idx, dst_to_goal))

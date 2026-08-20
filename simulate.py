@@ -29,6 +29,7 @@ from utils.utils import load_config, poses_from_posedir, get_poses_lineset, get_
 
 CONFIG_PATH = "config.yml"
 config = load_config("config.yml")
+auto_capture = os.environ.get("MONONAV_AUTO_CAPTURE", "false").lower() in ("1", "true", "yes")
 
 data_dir = config["data_dir"] # parent directory to look for RGB images, and save depth images
 pose_dir = os.path.join(data_dir, "crazyflie-poses")
@@ -91,5 +92,14 @@ for i in range(0, len(poses), n):
     # coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame().scale(0.5, center=(0, 0, 0))
     # visualizer.add_geometry(coordinate_frame.transform(pose))
 
-visualizer.run()
+if auto_capture:
+    visualizer.reset_view_point(True)
+    for _ in range(30):
+        visualizer.poll_events()
+        visualizer.update_renderer()
+    capture_path = os.path.join(data_dir, "planner_view.png")
+    visualizer.capture_screen_image(capture_path, do_render=True)
+    print("Saved planner capture to:", capture_path)
+else:
+    visualizer.run()
 visualizer.destroy_window()
