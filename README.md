@@ -34,6 +34,25 @@ In addition, we include the following resources in the `/utils/` directory:
 
 We hope you enjoy MonoNav!
 
+## AirStack online demo
+
+This checkout also includes an online adapter for AirStack. It consumes the simulated
+left RGB camera and the ground-truth optical-camera pose, runs ZoeDepth and Open3D TSDF
+fusion on the GPU, evaluates the original MonoNav motion primitives, and displays live
+RGB, depth, reconstruction, and primitive windows.
+
+After AirStack and `mononav_bridge` are running:
+
+```bash
+./docker/run_airstack_live.sh
+```
+
+The existing `mononav-demo:1.0` image is reused; this command does not rebuild it. Drag
+and scroll in the Open3D window to change the viewpoint. Flight command execution is
+gated separately in both the AirStack bridge and the worker. See
+`robot/ros_ws/src/local/planners/mononav_bridge/README.md` in the adjacent AirStack
+checkout before enabling it.
+
 ## Installation and Configuration
 
 Clone the repository and its submodules (ZoeDepth):
@@ -181,4 +200,3 @@ MonoNav is a "work in progress" - there are many exciting directions for future 
   url       = {https://arxiv.org/abs/2311.14100}
 }
 ```
-
