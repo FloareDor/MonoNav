@@ -48,6 +48,7 @@ def post_trajectory(server_url, primitive_index, points, velocity, execute):
             "primitive_index": int(primitive_index),
             "velocity": float(velocity),
             "execute": bool(execute),
+            "replace": True,
             "waypoints": points.tolist(),
         }
     ).encode("utf-8")
@@ -62,6 +63,28 @@ def post_trajectory(server_url, primitive_index, points, velocity, execute):
             return json.loads(response.read())
     except urllib.error.HTTPError as exc:
         return json.loads(exc.read())
+
+
+def make_yaw_scan(camera_pose, direction, yaw_degrees, radius, point_count=17):
+    """Generate a tiny-radius arc that changes heading with negligible translation."""
+    position = camera_pose[:3, 3]
+    forward = camera_pose[:3, 2]
+    heading = float(np.arctan2(forward[1], forward[0]))
+    yaw_delta = float(direction) * np.deg2rad(yaw_degrees)
+    theta = np.linspace(0.0, yaw_delta, point_count)
+    magnitude = np.abs(theta)
+    forward_offset = radius * np.sin(magnitude)
+    left_offset = np.sign(yaw_delta) * radius * (1.0 - np.cos(magnitude))
+    forward_xy = np.asarray([np.cos(heading), np.sin(heading)])
+    left_xy = np.asarray([-np.sin(heading), np.cos(heading)])
+    xy = (
+        position[:2]
+        + forward_offset[:, None] * forward_xy
+        + left_offset[:, None] * left_xy
+    )
+    xyz = np.column_stack((xy, np.full(point_count, position[2])))
+    yaw = heading + theta
+    return np.column_stack((xyz, yaw))
 
 
 def post_pause(server_url):
@@ -219,6 +242,16 @@ def main():
         default=0.4,
         help="collision-check TSDF voxels within this distance above/below the camera (m)",
     )
+    parser.add_argument("--recovery-yaw-deg", type=float, default=25.0)
+    parser.add_argument("--recovery-radius", type=float, default=0.03)
+    parser.add_argument("--recovery-velocity", type=float, default=0.03)
+    parser.add_argument("--max-recovery-steps", type=int, default=12)
+    parser.add_argument(
+        "--min-tsdf-points",
+        type=int,
+        default=1000,
+        help="do not execute motion until this many weighted TSDF surface points exist",
+    )
     args = parser.parse_args()
 
     config = load_config("config.yml")
@@ -262,6 +295,10 @@ def main():
     mission_complete = False
     pause_sent = False
     unsafe_frame_count = 0
+    recovery_steps = 0
+    recovery_direction = 1
+    recovery_mode = "none"
+    point_count = 0
     stop_reason = ""
     flight_started = not args.wait_for_start
 
@@ -331,6 +368,7 @@ def main():
                 transformed_lines.append(line)
 
             should_stop = False
+            chosen = None
             if fused_frames >= args.warmup_frames:
                 try:
                     should_stop, chosen = choose_primitive(
@@ -354,16 +392,32 @@ def main():
 
             transformed_lines[selected_index].paint_uniform_color([0.0, 1.0, 0.0])
             world_primitive = transform_primitive(trajectory_lines[selected_index], pose)
-            if flight_started and should_stop:
+            map_ready = point_count >= args.min_tsdf_points
+            extreme_selected = chosen in (0, len(trajectory_lines) - 1)
+            if chosen == 0:
+                recovery_direction = 1
+            elif chosen == len(trajectory_lines) - 1:
+                recovery_direction = -1
+            recovery_mode = "none"
+            if flight_started and map_ready and should_stop:
                 unsafe_frame_count += 1
+                if unsafe_frame_count == 1:
+                    print(f"UNSAFE HOLD: {post_pause(args.server)}")
                 if unsafe_frame_count >= args.stop_confirm_frames:
-                    mission_complete = True
-                    stop_reason = (
-                        f"no primitive satisfies {args.min_dist2obs:.2f} m clearance "
-                        f"for {unsafe_frame_count} consecutive frames"
-                    )
+                    recovery_mode = "blocked yaw scan"
+            elif flight_started and map_ready and extreme_selected:
+                unsafe_frame_count = 0
+                recovery_mode = "extreme-primitive yaw scan"
             else:
                 unsafe_frame_count = 0
+                if flight_started:
+                    recovery_steps = 0
+
+            if recovery_mode != "none" and recovery_steps >= args.max_recovery_steps:
+                mission_complete = True
+                stop_reason = (
+                    f"no central safe primitive after {recovery_steps} yaw scans"
+                )
             if mission_complete and args.execute and not pause_sent:
                 print(
                     f"Mission stopping ({stop_reason}) at goal distance "
@@ -375,16 +429,40 @@ def main():
                 args.execute
                 and flight_started
                 and fused_frames >= args.warmup_frames
+                and map_ready
                 and not should_stop
+                and not extreme_selected
                 and not mission_complete
             )
-            response = post_trajectory(
-                args.server,
-                selected_index,
-                world_primitive,
-                args.velocity if execute_this_primitive else float(forward_speed),
-                execute_this_primitive,
-            )
+            if (
+                args.execute
+                and flight_started
+                and map_ready
+                and recovery_mode != "none"
+                and not mission_complete
+            ):
+                yaw_scan = make_yaw_scan(
+                    pose,
+                    recovery_direction,
+                    args.recovery_yaw_deg,
+                    args.recovery_radius,
+                )
+                response = post_trajectory(
+                    args.server, -1, yaw_scan, args.recovery_velocity, True
+                )
+                recovery_steps += 1
+                print(
+                    f"RECOVERY {recovery_steps}/{args.max_recovery_steps}: "
+                    f"{recovery_mode}, yaw_step={recovery_direction * args.recovery_yaw_deg:.1f} deg"
+                )
+            else:
+                response = post_trajectory(
+                    args.server,
+                    selected_index,
+                    world_primitive,
+                    args.velocity if execute_this_primitive else float(forward_speed),
+                    execute_this_primitive,
+                )
 
             point_count = update_open3d(
                 visualizer,
@@ -399,8 +477,10 @@ def main():
                 f"frame={fused_frames}  Zoe={inference_seconds * 1000:.0f} ms  "
                 f"primitive={selected_index}/{len(trajectory_lines)-1}  "
                 f"goal={distance_to_goal:.2f} m  clearance={args.min_dist2obs:.2f} m  "
-                f"TSDF={point_count} pts  unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
-                f"blocked={should_stop}  stop={stop_reason if mission_complete else 'no'}"
+                f"TSDF={point_count}/{args.min_tsdf_points} pts  map_ready={map_ready}  "
+                f"unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
+                f"blocked={should_stop}  recovery={recovery_mode}  "
+                f"stop={stop_reason if mission_complete else 'no'}"
             )
             cv2.putText(display_rgb, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
             if args.execute and not flight_started:
@@ -424,6 +504,7 @@ def main():
                 stop_reason = "running"
                 pause_sent = False
                 unsafe_frame_count = 0
+                recovery_steps = 0
                 flight_started = True
                 goal_position = (pose @ np.array([0.0, 0.0, args.goal_distance, 1.0]))[:3].reshape(1, 3)
                 initial_camera_altitude = float(pose[2, 3])
