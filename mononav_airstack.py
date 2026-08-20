@@ -94,8 +94,17 @@ def transform_primitive(lineset, camera_pose):
     return np.column_stack((points, yaw))
 
 
+def set_default_view(visualizer, lookat):
+    """Use a stable Z-up isometric view instead of Open3D's arbitrary auto-fit view."""
+    control = visualizer.get_view_control()
+    control.set_lookat(np.asarray(lookat, dtype=np.float64))
+    control.set_front(np.asarray([0.634, -0.634, -0.444]))
+    control.set_up(np.asarray([0.314, -0.314, 0.896]))
+    control.set_zoom(0.45)
+
+
 def create_visualizer():
-    visualizer = o3d.visualization.Visualizer()
+    visualizer = o3d.visualization.VisualizerWithKeyCallback()
     ok = visualizer.create_window(
         window_name="MonoNav - live TSDF and motion primitives",
         width=880,
@@ -108,23 +117,64 @@ def create_visualizer():
     options = visualizer.get_render_option()
     options.background_color = np.asarray([0.06, 0.07, 0.09])
     options.point_size = 3.0
-    return visualizer
+    state = {
+        "cloud": o3d.geometry.PointCloud(),
+        "lines": [],
+        "geometries_added": False,
+        "view_initialized": False,
+        "lookat": np.zeros(3),
+    }
+
+    def reset_view_callback(vis):
+        set_default_view(vis, state["lookat"])
+        return False
+
+    visualizer.register_key_callback(ord("R"), reset_view_callback)
+    return visualizer, state
 
 
-def update_open3d(visualizer, vbg, weight_threshold, trajectory_lines, first_view):
+def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
     point_cloud = vbg.extract_point_cloud(weight_threshold).cpu().to_legacy()
     point_count = len(point_cloud.points)
-    visualizer.clear_geometries()
-    # The first few fused frames may not yet meet the TSDF weight threshold.
-    # Keep requesting an automatic view fit until a non-empty cloud exists;
-    # otherwise Open3D permanently points at an empty bounding box.
-    reset_view = first_view and point_count > 0
-    visualizer.add_geometry(point_cloud, reset_bounding_box=reset_view)
-    for line in trajectory_lines:
-        visualizer.add_geometry(line, reset_bounding_box=False)
+
+    # Keep the same geometry objects registered with the renderer. Clearing and
+    # re-adding them every fusion frame makes mouse navigation stutter and can
+    # disturb the user's chosen camera view.
+    state["cloud"].points = point_cloud.points
+    state["cloud"].colors = point_cloud.colors
+    state["cloud"].normals = point_cloud.normals
+    if not state["geometries_added"]:
+        visualizer.add_geometry(state["cloud"], reset_bounding_box=False)
+        state["lines"] = [copy.deepcopy(line) for line in trajectory_lines]
+        for line in state["lines"]:
+            visualizer.add_geometry(line, reset_bounding_box=False)
+        state["geometries_added"] = True
+    else:
+        visualizer.update_geometry(state["cloud"])
+        for displayed, updated in zip(state["lines"], trajectory_lines):
+            displayed.points = updated.points
+            displayed.lines = updated.lines
+            displayed.colors = updated.colors
+            visualizer.update_geometry(displayed)
+
+    # The first few frames can be empty. Initialize the view only once a useful
+    # reconstruction exists, and never overwrite subsequent mouse adjustments.
+    if point_count >= 200 and not state["view_initialized"]:
+        state["lookat"] = point_cloud.get_axis_aligned_bounding_box().get_center()
+        set_default_view(visualizer, state["lookat"])
+        state["view_initialized"] = True
     visualizer.poll_events()
     visualizer.update_renderer()
-    return not reset_view and first_view, point_count
+    return point_count
+
+
+def pump_open3d_events(visualizer, duration):
+    """Keep mouse navigation responsive while waiting for the next fusion tick."""
+    deadline = time.monotonic() + max(0.0, duration)
+    while time.monotonic() < deadline:
+        visualizer.poll_events()
+        visualizer.update_renderer()
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
 
 def main():
@@ -178,7 +228,7 @@ def main():
     )
     trajectory_list = get_trajlist(config["trajlib_dir"])
     trajectory_lines, _, forward_speed, _ = get_traj_linesets(trajectory_list)
-    visualizer = create_visualizer()
+    visualizer, visualizer_state = create_visualizer()
     rgb_window = "MonoNav - live AirStack RGB"
     depth_window = "MonoNav - live ZoeDepth"
     for window_name, left, top in (
@@ -196,7 +246,6 @@ def main():
     initial_camera_altitude = None
     last_sequence = -1
     fused_frames = 0
-    first_view = True
     selected_index = len(trajectory_lines) // 2
     min_period = 1.0 / max(args.rate, 0.1)
     mission_complete = False
@@ -206,7 +255,10 @@ def main():
     flight_started = not args.wait_for_start
 
     print(f"Connecting to AirStack bridge at {args.server}")
-    print("Controls: drag/scroll in the Open3D window to change viewpoint; press Q in RGB/depth to stop")
+    print(
+        "Open3D controls: left-drag rotate, Ctrl+left-drag pan, wheel zoom, "
+        "R reset to the Z-up view; press Q in RGB/depth to stop"
+    )
     print(f"Trajectory execution requested: {args.execute}")
     if args.execute and args.wait_for_start:
         print("START GATE CLOSED: arrange the GUI/recording, then focus RGB or Depth and press S or Space")
@@ -319,12 +371,12 @@ def main():
                 execute_this_primitive,
             )
 
-            first_view, point_count = update_open3d(
+            point_count = update_open3d(
                 visualizer,
+                visualizer_state,
                 vbg_wrapper.vbg,
                 config["weight_threshold"],
                 transformed_lines,
-                first_view,
             )
 
             display_rgb = cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR)
@@ -368,7 +420,7 @@ def main():
 
             remaining = min_period - (time.monotonic() - loop_start)
             if remaining > 0:
-                time.sleep(remaining)
+                pump_open3d_events(visualizer, remaining)
     finally:
         if args.execute:
             print(f"Requesting hover: {post_pause(args.server)}")
