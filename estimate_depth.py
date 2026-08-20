@@ -42,6 +42,8 @@ This script runs a depth estimation model on a directory of RGB images and saves
 # LOAD CONFIG
 CONFIG_PATH = "config.yml"
 config = load_config("config.yml")
+live_visualization = os.environ.get("MONONAV_LIVE_VISUALIZATION", "false").lower() in ("1", "true", "yes")
+live_delay_ms = int(os.environ.get("MONONAV_LIVE_DEPTH_DELAY_MS", "1"))
 data_dir = config["data_dir"] # parent directory to look for RGB images, and save depth images
 camera_source = config["camera_source"] # what camera was used for the RGB images?
 print("Loading" + camera_source + "images from: ", data_dir, ".")
@@ -83,10 +85,27 @@ for frame_number in range(0, end_frame):
     kinect_rgb = cv2.cvtColor(kinect_rgb, cv2.COLOR_BGR2RGB)
     # Compute depth
     depth_numpy, depth_colormap = compute_depth(kinect_rgb, zoe)
+
+    if live_visualization:
+        display_rgb = cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR)
+        cv2.putText(display_rgb, "RGB input", (18, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(depth_colormap, "ZoeDepth metric depth", (18, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        live_frame = np.hstack((display_rgb, depth_colormap))
+        cv2.putText(live_frame, "Frame %d / %d  |  Q: hide this window" % (frame_number + 1, end_frame),
+                    (18, live_frame.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.imshow("MonoNav 1/3 - Live RGB to ZoeDepth", live_frame)
+        if cv2.waitKey(max(1, live_delay_ms)) & 0xFF == ord("q"):
+            live_visualization = False
+            cv2.destroyAllWindows()
     # Save images
     cv2.imwrite(kinect_img_dir + "/kinect_frame-%06d.rgb.jpg"%(frame_number), kinect_rgb)
     cv2.imwrite(kinect_depth_dir + "/" + "kinect_frame-%06d.depth.jpg"%(frame_number), depth_colormap)
     np.save(kinect_depth_dir + "/" + "kinect_frame-%06d.depth.npy"%(frame_number), depth_numpy) # saved in meters
 
 print("Time to compute depth for %d images: %f"%(end_frame, time.time()-start_time))
+if live_visualization:
+    cv2.destroyAllWindows()
 # On Nvidia GeForce RTX 4090: 13.6 s for 80 images
