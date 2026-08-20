@@ -7,6 +7,7 @@ import struct
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 import cv2
 import numpy as np
@@ -27,19 +28,31 @@ from utils.utils import (
     get_trajlist,
     load_config,
     transform_image,
+    transform_depth_image,
 )
 
 
-def fetch_frame(server_url):
+def fetch_frame(server_url, include_depth=False):
     with urllib.request.urlopen(server_url.rstrip("/") + "/frame", timeout=3.0) as response:
         body = response.read()
     metadata_length = struct.unpack("!I", body[:4])[0]
     metadata = json.loads(body[4 : 4 + metadata_length])
-    jpeg = np.frombuffer(body[4 + metadata_length :], dtype=np.uint8)
+    payload = body[4 + metadata_length :]
+    jpeg_length = int(metadata.get("jpeg_bytes", len(payload)))
+    jpeg = np.frombuffer(payload[:jpeg_length], dtype=np.uint8)
     bgr = cv2.imdecode(jpeg, cv2.IMREAD_COLOR)
     if bgr is None:
         raise RuntimeError("AirStack bridge returned an invalid JPEG")
-    return metadata, bgr
+    if not include_depth:
+        return metadata, bgr
+    depth_length = int(metadata.get("depth_bytes", 0))
+    if depth_length <= 0:
+        return metadata, bgr, None
+    depth_payload = payload[jpeg_length : jpeg_length + depth_length]
+    depth = np.frombuffer(zlib.decompress(depth_payload), dtype="<f4").reshape(
+        int(metadata["depth_height"]), int(metadata["depth_width"])
+    )
+    return metadata, bgr, depth
 
 
 def post_trajectory(server_url, primitive_index, points, velocity, execute):
@@ -105,6 +118,157 @@ def camera_matrix(metadata):
     return np.asarray(metadata["k"], dtype=np.float64).reshape(3, 3)
 
 
+def metric_depth_colormap(depth_m, depth_max):
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+    normalized = np.zeros(depth_m.shape, dtype=np.uint8)
+    normalized[valid] = np.clip(
+        255.0 * (1.0 - depth_m[valid] / float(depth_max)), 0.0, 255.0
+    ).astype(np.uint8)
+    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+    colored[~valid] = 0
+    return colored
+
+
+def filter_isolated_near_depth(
+    depth_mm,
+    kernel_size=3,
+    absolute_threshold_mm=250.0,
+    relative_threshold=0.12,
+):
+    """Replace isolated, spuriously-near Zoe pixels with the local median.
+
+    MonoNav's offline hallway data contains spatially smooth depth estimates.
+    Synthetic RGB can instead produce small near-depth islands in otherwise
+    farther regions; TSDF fusion turns those islands into persistent floating
+    surfaces.  A near-only median gate removes those islands while preserving
+    ordinary depth variation and the interiors of real foreground objects.
+
+    This is deliberately adapter-local: the original offline MonoNav pipeline
+    and its saved depth maps are not changed.
+    """
+    depth = np.asarray(depth_mm, dtype=np.float32)
+    if kernel_size <= 1:
+        return depth_mm, 0
+    if kernel_size % 2 == 0 or kernel_size > 5:
+        raise ValueError("Zoe speckle kernel must be odd and no larger than 5")
+    local_median = cv2.medianBlur(depth, int(kernel_size))
+    threshold = np.maximum(
+        float(absolute_threshold_mm),
+        float(relative_threshold) * local_median,
+    )
+    isolated_near = (
+        (depth > 0.0)
+        & (local_median > 0.0)
+        & ((local_median - depth) > threshold)
+    )
+    # A true foreground boundary can be in the minority of a 3x3 window too.
+    # Preserve it when at least three pixels locally support the same near
+    # surface; a salt-and-pepper island has only itself (or one neighbour).
+    radius = int(kernel_size) // 2
+    padded = cv2.copyMakeBorder(
+        depth, radius, radius, radius, radius, cv2.BORDER_REPLICATE
+    )
+    support = np.zeros(depth.shape, dtype=np.uint8)
+    agreement = np.maximum(75.0, 0.05 * depth)
+    for row_offset in range(int(kernel_size)):
+        for col_offset in range(int(kernel_size)):
+            neighbour = padded[
+                row_offset : row_offset + depth.shape[0],
+                col_offset : col_offset + depth.shape[1],
+            ]
+            support += (np.abs(neighbour - depth) <= agreement).astype(np.uint8)
+    isolated_near &= support <= 2
+    filtered = depth.copy()
+    filtered[isolated_near] = local_median[isolated_near]
+    return np.clip(filtered, 0.0, 65535.0).astype(np.uint16), int(
+        np.count_nonzero(isolated_near)
+    )
+
+
+def reproject_depth_to_camera(depth_mm, source_pose, target_pose, intrinsic):
+    """Z-buffer a prior metric depth image into the current optical camera."""
+    depth = np.asarray(depth_mm, dtype=np.float32) / 1000.0
+    height, width = depth.shape
+    rows, cols = np.indices((height, width), dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0.0)
+    if not np.any(valid):
+        return np.zeros(depth.shape, dtype=np.float32)
+
+    z = depth[valid]
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+    points = np.vstack(
+        (
+            (cols[valid] - cx) * z / fx,
+            (rows[valid] - cy) * z / fy,
+            z,
+        )
+    )
+    source_to_target = np.linalg.inv(target_pose) @ source_pose
+    target_points = (
+        source_to_target[:3, :3] @ points + source_to_target[:3, 3:4]
+    )
+    target_z = target_points[2]
+    in_front = target_z > 1.0e-4
+    projected_col = np.rint(
+        fx * target_points[0, in_front] / target_z[in_front] + cx
+    ).astype(np.int32)
+    projected_row = np.rint(
+        fy * target_points[1, in_front] / target_z[in_front] + cy
+    ).astype(np.int32)
+    in_image = (
+        (projected_col >= 0)
+        & (projected_col < width)
+        & (projected_row >= 0)
+        & (projected_row < height)
+    )
+    flat_index = (
+        projected_row[in_image] * width + projected_col[in_image]
+    )
+    reference = np.full(height * width, np.inf, dtype=np.float32)
+    np.minimum.at(reference, flat_index, target_z[in_front][in_image])
+    reference[~np.isfinite(reference)] = 0.0
+    return reference.reshape(height, width) * 1000.0
+
+
+def filter_temporal_near_depth(
+    depth_mm,
+    reference_mm,
+    absolute_threshold_mm=300.0,
+    relative_threshold=0.12,
+    max_component_pixels=200,
+):
+    """Reject small surfaces that appear implausibly nearer than the prior view."""
+    depth = np.asarray(depth_mm, dtype=np.float32)
+    reference = np.asarray(reference_mm, dtype=np.float32)
+    threshold = np.maximum(
+        float(absolute_threshold_mm),
+        float(relative_threshold) * reference,
+    )
+    sudden_near = (
+        (depth > 0.0)
+        & (reference > 0.0)
+        & ((reference - depth) > threshold)
+    )
+    if not np.any(sudden_near) or max_component_pixels <= 0:
+        return depth_mm, 0
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        sudden_near.astype(np.uint8), connectivity=8
+    )
+    areas = stats[:, cv2.CC_STAT_AREA]
+    reject_label = np.zeros(count, dtype=bool)
+    reject_label[1:] = areas[1:] <= int(max_component_pixels)
+    rejected = reject_label[labels]
+    filtered = depth.copy()
+    filtered[rejected] = reference[rejected]
+    return np.clip(filtered, 0.0, 65535.0).astype(np.uint16), int(
+        np.count_nonzero(rejected)
+    )
+
+
 def transform_primitive(lineset, camera_pose):
     transformed = copy.deepcopy(lineset)
     transformed.transform(camera_pose)
@@ -115,6 +279,31 @@ def transform_primitive(lineset, camera_pose):
     yaw = np.arctan2(delta[:, 1], delta[:, 0])
     yaw = np.concatenate((yaw, yaw[-1:]))
     return np.column_stack((points, yaw))
+
+
+def transform_execution_primitive(trajectory, camera_pose, point_count=17):
+    """Transform only the one-period motion, excluding its look-ahead extension.
+
+    MonoNav appends a straight one-metre extension to ``x_sample/y_sample`` so
+    collision checking sees beyond the one-second control primitive.  That
+    extension is not a command and must never be sent to AirStack.
+    """
+    x_forward = np.asarray(trajectory["xvals"], dtype=np.float64)
+    y_left = np.asarray(trajectory["yvals"], dtype=np.float64)
+    sample_indices = np.linspace(
+        0, len(x_forward) - 1, min(point_count - 1, len(x_forward)), dtype=int
+    )
+    # Optical camera coordinates are +Z forward, +X right, +Y down.
+    local_points = np.column_stack(
+        (-y_left[sample_indices], np.zeros(len(sample_indices)), x_forward[sample_indices])
+    )
+    local_points = np.vstack((np.zeros(3), local_points))
+    homogeneous = np.column_stack((local_points, np.ones(len(local_points))))
+    world_points = (camera_pose @ homogeneous.T).T[:, :3]
+    delta = np.diff(world_points[:, :2], axis=0)
+    yaw = np.arctan2(delta[:, 1], delta[:, 0])
+    yaw = np.concatenate((yaw, yaw[-1:]))
+    return np.column_stack((world_points, yaw))
 
 
 def set_default_view(visualizer, lookat):
@@ -208,6 +397,60 @@ def pump_open3d_events(visualizer, duration):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="http://airstack-robot-desktop-1:8765")
+    parser.add_argument(
+        "--depth-source",
+        choices=("zoe", "ground-truth"),
+        default="zoe",
+        help="use ZoeDepth inference or simulator metric depth for an A/B baseline",
+    )
+    parser.add_argument(
+        "--zoe-depth-scale",
+        type=float,
+        default=1.0,
+        help="fixed metric scale calibration applied to ZoeDepth output",
+    )
+    parser.add_argument(
+        "--zoe-speckle-kernel",
+        type=int,
+        default=3,
+        help="near-depth outlier median kernel; 1 disables the adapter-local filter",
+    )
+    parser.add_argument(
+        "--zoe-speckle-absolute-mm",
+        type=float,
+        default=250.0,
+        help="minimum near-depth disagreement before a Zoe pixel is replaced",
+    )
+    parser.add_argument(
+        "--zoe-speckle-relative",
+        type=float,
+        default=0.12,
+        help="relative local-depth disagreement before a Zoe pixel is replaced",
+    )
+    parser.add_argument(
+        "--zoe-temporal-near-mm",
+        type=float,
+        default=300.0,
+        help="absolute current-vs-warped-prior near-depth disagreement gate",
+    )
+    parser.add_argument(
+        "--zoe-temporal-near-relative",
+        type=float,
+        default=0.12,
+        help="relative current-vs-warped-prior near-depth disagreement gate",
+    )
+    parser.add_argument(
+        "--zoe-temporal-max-component",
+        type=int,
+        default=200,
+        help="maximum sudden-near component area to reject; 0 disables the gate",
+    )
+    parser.add_argument("--planner-debug", action="store_true")
+    parser.add_argument(
+        "--trajlib-dir",
+        default="utils/trajlib_airstack",
+        help="AirStack-specific motion primitive library",
+    )
     parser.add_argument("--rate", type=float, default=2.0, help="maximum fusion rate in Hz")
     parser.add_argument("--warmup-frames", type=int, default=4)
     parser.add_argument("--execute", action="store_true", help="request actual AirStack execution")
@@ -217,7 +460,16 @@ def main():
         help="fuse and visualize immediately, but wait for S/Space in an OpenCV window before flight",
     )
     parser.add_argument("--goal-distance", type=float, default=8.0)
-    parser.add_argument("--velocity", type=float, default=0.35)
+    parser.add_argument("--velocity", type=float, default=0.4)
+    parser.add_argument(
+        "--command-hold-seconds",
+        type=float,
+        default=1.25,
+        help=(
+            "minimum time to let an accepted motion primitive advance before "
+            "replacing it; an unsafe plan still pauses immediately"
+        ),
+    )
     parser.add_argument(
         "--min-dist2obs",
         type=float,
@@ -242,9 +494,21 @@ def main():
         default=0.4,
         help="collision-check TSDF voxels within this distance above/below the camera (m)",
     )
+    parser.add_argument(
+        "--clearance-recovery-distance",
+        type=float,
+        default=0.25,
+        help="initial path length allowed to exit an already-inflated obstacle margin",
+    )
     parser.add_argument("--recovery-yaw-deg", type=float, default=25.0)
     parser.add_argument("--recovery-radius", type=float, default=0.03)
     parser.add_argument("--recovery-velocity", type=float, default=0.03)
+    parser.add_argument(
+        "--recovery-hold-seconds",
+        type=float,
+        default=2.0,
+        help="minimum time to finish one yaw scan before another recovery command",
+    )
     parser.add_argument("--max-recovery-steps", type=int, default=12)
     parser.add_argument(
         "--min-tsdf-points",
@@ -258,25 +522,44 @@ def main():
         default=3.0,
         help="retain only TSDF voxel blocks within this 3D radius of the camera (m)",
     )
+    parser.add_argument(
+        "--tsdf-block-warning",
+        "--max-tsdf-blocks",
+        dest="tsdf_block_warning",
+        type=int,
+        default=80000,
+        help=(
+            "warn when the local TSDF exceeds this many active blocks; the map "
+            "is never globally reset (0 disables the warning; "
+            "--max-tsdf-blocks is a backward-compatible alias)"
+        ),
+    )
     args = parser.parse_args()
 
     config = load_config("config.yml")
-    print("Loading ZoeDepth...")
-    zoe_config = get_config("zoedepth", config["zoedepth_mode"])
-    zoe = build_model(zoe_config)
-    device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    zoe = zoe.to(device_name)
-    zoe.eval()
-    print(f"ZoeDepth ready on {device_name}")
+    zoe = None
+    if args.depth_source == "zoe":
+        print("Loading ZoeDepth...")
+        zoe_config = get_config("zoedepth", config["zoedepth_mode"])
+        zoe = build_model(zoe_config)
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        zoe = zoe.to(device_name)
+        zoe.eval()
+        print(f"ZoeDepth ready on {device_name}")
+    else:
+        print("Using Isaac Sim ground-truth metric depth (ZoeDepth bypassed)")
 
     settings = config["VoxelBlockGrid"]
-    vbg_wrapper = VoxelBlockGrid(
-        settings["depth_scale"],
-        settings["depth_max"],
-        settings["trunc_voxel_multiplier"],
-        o3d.core.Device(settings["device"]),
-    )
-    trajectory_list = get_trajlist(config["trajlib_dir"])
+    def make_vbg_wrapper():
+        return VoxelBlockGrid(
+            settings["depth_scale"],
+            settings["depth_max"],
+            settings["trunc_voxel_multiplier"],
+            o3d.core.Device(settings["device"]),
+        )
+
+    vbg_wrapper = make_vbg_wrapper()
+    trajectory_list = get_trajlist(args.trajlib_dir)
     trajectory_lines, _, forward_speed, _ = get_traj_linesets(trajectory_list)
     visualizer, visualizer_state = create_visualizer()
     rgb_window = "MonoNav - live AirStack RGB"
@@ -308,6 +591,12 @@ def main():
     tsdf_block_count = 0
     stop_reason = ""
     flight_started = not args.wait_for_start
+    last_motion_command_time = 0.0
+    last_recovery_command_time = 0.0
+    active_primitive_index = None
+    last_capacity_warning_time = 0.0
+    previous_zoe_depth_mm = None
+    previous_zoe_pose = None
 
     print(f"Connecting to AirStack bridge at {args.server}")
     print(
@@ -322,7 +611,15 @@ def main():
         while True:
             loop_start = time.monotonic()
             try:
-                metadata, bgr = fetch_frame(args.server)
+                if args.depth_source == "ground-truth":
+                    metadata, bgr, source_depth_m = fetch_frame(
+                        args.server, include_depth=True
+                    )
+                    if source_depth_m is None:
+                        raise RuntimeError("AirStack bridge has no ground-truth depth frame")
+                else:
+                    metadata, bgr = fetch_frame(args.server)
+                    source_depth_m = None
             except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
                 print(f"Waiting for AirStack frame: {exc}")
                 time.sleep(1.0)
@@ -353,14 +650,76 @@ def main():
                 mission_complete = True
                 stop_reason = "altitude deviation"
 
+            # Keep a spatial sliding window.  Pruning before integration frees
+            # capacity gradually and, unlike rebuilding the VBG, never makes
+            # the entire reconstruction disappear at once.
+            tsdf_block_count, pruned_before = vbg_wrapper.prune_outside_radius(
+                pose[:3, 3], args.tsdf_local_radius
+            )
+            if pruned_before > 0:
+                print(
+                    f"TSDF sliding window pre-prune: "
+                    f"blocks={tsdf_block_count}, pruned={pruned_before}"
+                )
+
             source_intrinsic = camera_matrix(metadata)
             zero_distortion = np.zeros(5, dtype=np.float64)
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             kinect_rgb = transform_image(rgb, source_intrinsic, zero_distortion, kinect)
 
             inference_start = time.monotonic()
-            with torch.inference_mode():
-                depth_mm, depth_colormap = compute_depth(kinect_rgb, zoe)
+            if args.depth_source == "zoe":
+                with torch.inference_mode():
+                    depth_mm, depth_colormap = compute_depth(kinect_rgb, zoe)
+                depth_mm = np.clip(
+                    depth_mm.astype(np.float32) * args.zoe_depth_scale,
+                    0.0,
+                    65535.0,
+                ).astype(np.uint16)
+                depth_mm, spatial_speckle_pixels = filter_isolated_near_depth(
+                    depth_mm,
+                    args.zoe_speckle_kernel,
+                    args.zoe_speckle_absolute_mm,
+                    args.zoe_speckle_relative,
+                )
+                temporal_speckle_pixels = 0
+                if (
+                    previous_zoe_depth_mm is not None
+                    and args.zoe_temporal_max_component > 0
+                ):
+                    reference_mm = reproject_depth_to_camera(
+                        previous_zoe_depth_mm,
+                        previous_zoe_pose,
+                        pose,
+                        kinect.intrinsic_matrix,
+                    )
+                    depth_mm, temporal_speckle_pixels = filter_temporal_near_depth(
+                        depth_mm,
+                        reference_mm,
+                        args.zoe_temporal_near_mm,
+                        args.zoe_temporal_near_relative,
+                        args.zoe_temporal_max_component,
+                    )
+                previous_zoe_depth_mm = depth_mm.copy()
+                previous_zoe_pose = pose.copy()
+                depth_colormap = cv2.applyColorMap(
+                    cv2.convertScaleAbs(depth_mm, alpha=0.03), cv2.COLORMAP_JET
+                )
+            else:
+                spatial_speckle_pixels = 0
+                temporal_speckle_pixels = 0
+                source_depth_m = transform_depth_image(
+                    source_depth_m, source_intrinsic, zero_distortion, kinect
+                )
+                source_depth_m = np.nan_to_num(
+                    source_depth_m, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                depth_mm = np.clip(source_depth_m * 1000.0, 0.0, 65535.0).astype(
+                    np.uint16
+                )
+                depth_colormap = metric_depth_colormap(
+                    source_depth_m, settings["depth_max"]
+                )
             inference_seconds = time.monotonic() - inference_start
             vbg_wrapper.integration_step(
                 cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR), depth_mm, pose
@@ -370,8 +729,20 @@ def main():
             )
             if pruned_blocks > 0:
                 print(
-                    f"TSDF local window: blocks={tsdf_block_count}, pruned={pruned_blocks}"
+                    f"TSDF sliding window post-prune: "
+                    f"blocks={tsdf_block_count}, pruned={pruned_blocks}"
                 )
+            now = time.monotonic()
+            if (
+                args.tsdf_block_warning > 0
+                and tsdf_block_count >= args.tsdf_block_warning
+                and now - last_capacity_warning_time >= 5.0
+            ):
+                print(
+                    f"TSDF CAPACITY WARNING: {tsdf_block_count} active blocks; "
+                    "map retained, consider reducing --tsdf-local-radius"
+                )
+                last_capacity_warning_time = now
             fused_frames += 1
 
             transformed_lines = []
@@ -398,6 +769,9 @@ def main():
                         2,  # AirStack map frame is Z-up.
                         float(pose[2, 3]),
                         args.planning_height_band,
+                        args.planner_debug,
+                        True,  # AirStack-only recovery from an inflated-margin start.
+                        args.clearance_recovery_distance,
                     )
                     if chosen is not None:
                         selected_index = chosen
@@ -405,7 +779,9 @@ def main():
                     print(f"Planner waiting for a usable reconstruction: {exc}")
 
             transformed_lines[selected_index].paint_uniform_color([0.0, 1.0, 0.0])
-            world_primitive = transform_primitive(trajectory_lines[selected_index], pose)
+            world_primitive = transform_execution_primitive(
+                trajectory_list[selected_index], pose
+            )
             map_ready = point_count >= args.min_tsdf_points
             extreme_selected = chosen in (0, len(trajectory_lines) - 1)
             if chosen == 0:
@@ -415,7 +791,7 @@ def main():
             recovery_mode = "none"
             if flight_started and map_ready and should_stop:
                 unsafe_frame_count += 1
-                if unsafe_frame_count == 1:
+                if args.execute and unsafe_frame_count == 1:
                     print(f"UNSAFE HOLD: {post_pause(args.server)}")
                 if unsafe_frame_count >= args.stop_confirm_frames:
                     recovery_mode = "blocked yaw scan"
@@ -455,28 +831,73 @@ def main():
                 and recovery_mode != "none"
                 and not mission_complete
             ):
-                yaw_scan = make_yaw_scan(
-                    pose,
-                    recovery_direction,
-                    args.recovery_yaw_deg,
-                    args.recovery_radius,
+                now = time.monotonic()
+                recovery_due = (
+                    last_recovery_command_time == 0.0
+                    or now - last_recovery_command_time >= args.recovery_hold_seconds
                 )
-                response = post_trajectory(
-                    args.server, -1, yaw_scan, args.recovery_velocity, True
-                )
-                recovery_steps += 1
-                print(
-                    f"RECOVERY {recovery_steps}/{args.max_recovery_steps}: "
-                    f"{recovery_mode}, yaw_step={recovery_direction * args.recovery_yaw_deg:.1f} deg"
-                )
+                if recovery_due:
+                    yaw_scan = make_yaw_scan(
+                        pose,
+                        recovery_direction,
+                        args.recovery_yaw_deg,
+                        args.recovery_radius,
+                    )
+                    response = post_trajectory(
+                        args.server, -1, yaw_scan, args.recovery_velocity, True
+                    )
+                    last_recovery_command_time = now
+                    last_motion_command_time = 0.0
+                    active_primitive_index = None
+                    recovery_steps += 1
+                    print(
+                        f"RECOVERY {recovery_steps}/{args.max_recovery_steps}: "
+                        f"{recovery_mode}, "
+                        f"yaw_step={recovery_direction * args.recovery_yaw_deg:.1f} deg"
+                    )
+                else:
+                    held_for = now - last_recovery_command_time
+                    response = {
+                        "accepted": False,
+                        "reason": (
+                            f"holding recovery {recovery_steps} "
+                            f"({held_for:.1f}/{args.recovery_hold_seconds:.1f}s)"
+                        ),
+                    }
             else:
-                response = post_trajectory(
-                    args.server,
-                    selected_index,
-                    world_primitive,
-                    args.velocity if execute_this_primitive else float(forward_speed),
-                    execute_this_primitive,
+                now = time.monotonic()
+                command_due = (
+                    last_motion_command_time == 0.0
+                    or now - last_motion_command_time >= args.command_hold_seconds
                 )
+                if execute_this_primitive and command_due:
+                    response = post_trajectory(
+                        args.server,
+                        selected_index,
+                        world_primitive,
+                        args.velocity,
+                        True,
+                    )
+                    last_motion_command_time = now
+                    last_recovery_command_time = 0.0
+                    active_primitive_index = selected_index
+                elif execute_this_primitive:
+                    held_for = now - last_motion_command_time
+                    response = {
+                        "accepted": False,
+                        "reason": (
+                            f"holding primitive {active_primitive_index} "
+                            f"({held_for:.1f}/{args.command_hold_seconds:.1f}s)"
+                        ),
+                    }
+                else:
+                    response = post_trajectory(
+                        args.server,
+                        selected_index,
+                        world_primitive,
+                        float(forward_speed),
+                        False,
+                    )
 
             point_count = update_open3d(
                 visualizer,
@@ -493,6 +914,7 @@ def main():
                 f"goal={distance_to_goal:.2f} m  clearance={args.min_dist2obs:.2f} m  "
                 f"TSDF={point_count}/{args.min_tsdf_points} pts  map_ready={map_ready}  "
                 f"blocks={tsdf_block_count}  "
+                f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels}  "
                 f"unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
                 f"blocked={should_stop}  recovery={recovery_mode}  "
                 f"stop={stop_reason if mission_complete else 'no'}"
@@ -508,7 +930,12 @@ def main():
                     (0, 215, 255),
                     2,
                 )
-            cv2.putText(depth_colormap, "ZoeDepth metric depth", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            depth_label = (
+                "ZoeDepth metric depth"
+                if args.depth_source == "zoe"
+                else "Isaac Sim ground-truth depth"
+            )
+            cv2.putText(depth_colormap, depth_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             cv2.imshow(rgb_window, display_rgb)
             cv2.imshow(depth_window, depth_colormap)
             key = cv2.waitKey(1) & 0xFF
@@ -520,6 +947,9 @@ def main():
                 pause_sent = False
                 unsafe_frame_count = 0
                 recovery_steps = 0
+                last_motion_command_time = 0.0
+                last_recovery_command_time = 0.0
+                active_primitive_index = None
                 flight_started = True
                 goal_position = (pose @ np.array([0.0, 0.0, args.goal_distance, 1.0]))[:3].reshape(1, 3)
                 initial_camera_altitude = float(pose[2, 3])
@@ -527,9 +957,13 @@ def main():
             elif args.execute and flight_started and key == ord("p"):
                 print(f"MANUAL PAUSE: {post_pause(args.server)}")
                 flight_started = False
+                last_motion_command_time = 0.0
+                last_recovery_command_time = 0.0
+                active_primitive_index = None
             print(
                 f"frame={fused_frames} seq={last_sequence} primitive={selected_index} "
                 f"tsdf_points={point_count} tsdf_blocks={tsdf_block_count} blocked={should_stop} "
+                f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels} "
                 f"zoe={inference_seconds:.3f}s bridge={response}",
                 flush=True,
             )

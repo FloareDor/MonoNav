@@ -17,17 +17,38 @@ By changing the trajectory constants and extension segment, you can generate a d
 If you change the trajlib_dir, be sure to update `trajlib_dir: 'utils/trajlib/'` in config.yml.
 """
 
+import argparse
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Trajectory Constants
+# Original MonoNav trajectory constants.  The AirStack adapter uses a separate
+# profile and output directory so the offline baseline remains unchanged.
 T = 1.0 # s, period of the primitive
-V = 0.5 # m/s, forward speed
-max_yawrate = 0.7 # rad/s
-num_trajectories = 7 # number of trajectories should be ODD (e.g., 11) to ensure a straight line is included
 num_commands = 65 # number of points in the trajectory
 num_points = 8 # how many points should be in each primitive and each extension segment? (for primitive evaluation)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--profile", choices=("original", "airstack"), default="original")
+parser.add_argument("--output-dir")
+parser.add_argument("--show", action="store_true")
+args = parser.parse_args()
+
+if args.profile == "original":
+    V = 0.5
+    max_yawrate = 0.7
+    num_trajectories = 7
+    default_dir = "trajlib"
+else:
+    V = 0.4
+    max_yawrate = 0.35
+    num_trajectories = 13
+    default_dir = "trajlib_airstack"
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+trajlib_dir = os.path.abspath(
+    args.output_dir or os.path.join(script_dir, default_dir)
+)
 
 # Extension segment - straight line at the end of the trajectory (to encourage foresight)
 x_ext = np.linspace(0., 1.0, num_points) # extension segment in the body frame (x = forward)
@@ -49,17 +70,10 @@ fig, (ax2, ax1) = plt.subplots(2, 1)#, sharex=True)
 fig.tight_layout()
 
 traj_num = 0
-trajlib_dir = './trajlib/'
-# os.mkdir(trajlib_dir) if not os.path.exists(trajlib_dir) else None
-
-if os.path.exists(trajlib_dir):
-    # Delete the existing trajectory library\
-    for filename in os.listdir(trajlib_dir):
-        file_path = os.path.join(trajlib_dir, filename)
-        os.remove(file_path)
-else:
-    # Create the directory
-    os.mkdir(trajlib_dir)
+os.makedirs(trajlib_dir, exist_ok=True)
+for filename in os.listdir(trajlib_dir):
+    if (filename.startswith("traj-") and filename.endswith(".npz")) or filename == "visualization.png":
+        os.remove(os.path.join(trajlib_dir, filename))
 
 trajlist = []
 
@@ -99,7 +113,7 @@ for A in Avals:
     }
 
     # Save to file
-    np.savez(trajlib_dir + 'traj-%02d.npz'%(traj_num), **trajectory)
+    np.savez(os.path.join(trajlib_dir, 'traj-%02d.npz'%(traj_num)), **trajectory)
     traj_num += 1
 
     # Top plot: yawrate and psi
@@ -123,6 +137,9 @@ ax2.legend(loc='center left', bbox_to_anchor=(1, 0.5))
 # Suggested plotting adjustment
 plt.subplots_adjust(0.125, 0.1, 0.75, 0.9, 0.2, 0.5)
 
-plt.savefig(trajlib_dir + 'visualization.png',dpi=300)
+plt.savefig(os.path.join(trajlib_dir, 'visualization.png'), dpi=300)
 
-plt.show()
+if args.show:
+    plt.show()
+else:
+    plt.close(fig)

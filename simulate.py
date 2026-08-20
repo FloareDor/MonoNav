@@ -21,7 +21,6 @@ and trajectory library affect the planning performance.
 """
 
 import os
-import time
 import open3d as o3d
 import numpy as np
 import copy
@@ -30,10 +29,6 @@ from utils.utils import load_config, poses_from_posedir, get_poses_lineset, get_
 
 CONFIG_PATH = "config.yml"
 config = load_config("config.yml")
-auto_capture = os.environ.get("MONONAV_AUTO_CAPTURE", "false").lower() in ("1", "true", "yes")
-live_visualization = os.environ.get("MONONAV_LIVE_VISUALIZATION", "false").lower() in ("1", "true", "yes")
-live_hold = os.environ.get("MONONAV_LIVE_HOLD", "true").lower() in ("1", "true", "yes")
-live_delay_s = int(os.environ.get("MONONAV_LIVE_PLANNER_DELAY_MS", "350")) / 1000.0
 
 data_dir = config["data_dir"] # parent directory to look for RGB images, and save depth images
 pose_dir = os.path.join(data_dir, "crazyflie-poses")
@@ -71,16 +66,9 @@ traj_linesets, period, forward_speed, amplitudes = get_traj_linesets(traj_list)
 
 # Create the visualizer and add components
 visualizer = o3d.visualization.Visualizer()
-visualizer.create_window(
-    window_name="MonoNav 3/3 - Live planner (green: selected primitive)",
-    width=1280,
-    height=720,
-)
+visualizer.create_window()
 visualizer.add_geometry(pcd.to_legacy())
 visualizer.add_geometry(pose_lineset)
-visualizer.reset_view_point(True)
-previous_live_primitives = []
-planner_window_open = True
 
 # For each pose, compute the optimal motion primitive.
 # Paint the optimal motion primitive green, and the rest black.
@@ -88,14 +76,6 @@ n = 5 # iterate over every n poses
 for i in range(0, len(poses), n):
     pose = poses[i]
     shouldStop, max_traj_idx = choose_primitive(vbg, pose, traj_linesets, goal_position, min_dist2obs, filterYvals, filterWeights, filterTSDF, weight_threshold)
-    print("Planning pose %d/%d: selected primitive=%s stop=%s" %
-          (i + 1, len(poses), max_traj_idx, shouldStop))
-
-    if live_visualization:
-        for primitive in previous_live_primitives:
-            visualizer.remove_geometry(primitive, reset_bounding_box=False)
-        previous_live_primitives = []
-
     for traj_idx, traj_lineset in enumerate(traj_linesets):
         traj_lineset_copy = copy.deepcopy(traj_lineset)
         traj_lineset_copy.transform(pose)
@@ -105,34 +85,11 @@ for i in range(0, len(poses), n):
         else:
             traj_lineset_copy.paint_uniform_color([0, 0, 0])
 
-        visualizer.add_geometry(traj_lineset_copy, reset_bounding_box=False)
-        if live_visualization:
-            previous_live_primitives.append(traj_lineset_copy)
-
-    if live_visualization:
-        planner_window_open = visualizer.poll_events()
-        if not planner_window_open:
-            break
-        visualizer.update_renderer()
-        time.sleep(live_delay_s)
+        visualizer.add_geometry(traj_lineset_copy)
 
     # # (Optional) Uncomment to add coordinate frame, which may look busy.
     # coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame().scale(0.5, center=(0, 0, 0))
     # visualizer.add_geometry(coordinate_frame.transform(pose))
 
-if live_visualization:
-    if live_hold and planner_window_open:
-        print("Live planning complete. Adjust the view, then close the window to finish.")
-        visualizer.run()
-elif auto_capture:
-    visualizer.reset_view_point(True)
-    for _ in range(30):
-        visualizer.poll_events()
-        visualizer.update_renderer()
-    capture_path = os.path.join(data_dir, "planner_view.png")
-    visualizer.capture_screen_image(capture_path, do_render=True)
-    print("Saved planner capture to:", capture_path)
-else:
-    visualizer.run()
-if planner_window_open or not live_visualization:
-    visualizer.destroy_window()
+visualizer.run()
+visualizer.destroy_window()

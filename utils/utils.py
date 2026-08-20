@@ -255,7 +255,9 @@ MonoNav Planner: Return the chosen trajectory index given the current position, 
 def choose_primitive(
         vbg, camera_position, traj_linesets, goal_position, dist_threshold,
         filterYvals, filterWeights, filterTSDF, weight_threshold,
-        vertical_axis=None, vertical_center=None, vertical_half_extent=None):
+        vertical_axis=None, vertical_center=None, vertical_half_extent=None,
+        debug=False, allow_clearance_escape=False, escape_distance=0.25,
+        escape_tolerance=0.05):
 
     # Boolean for stopping criteria
     shouldStop = False
@@ -315,6 +317,7 @@ def choose_primitive(
     max_traj_score = -np.inf # track best trajectory
     min_goal_score = np.inf # track proximity to goal
     max_traj_idx = None # track the index of the best trajectory
+    clearances = []
 
     # iterate over the sorted traj linesets
     for traj_idx, traj_linset in enumerate(traj_linesets):
@@ -323,8 +326,26 @@ def choose_primitive(
         pts = np.asarray(traj_lineset_copy.points) # meters # extract the points from the lineset
         # Querying a KD-tree gives the same minimum obstacle distance without
         # materializing the potentially multi-gigabyte voxel-by-point matrix.
-        nearest_voxel_dist = np.min(obstacle_tree.query(pts, k=1)[0])
-        if nearest_voxel_dist > dist_threshold:
+        point_clearances = obstacle_tree.query(pts, k=1)[0]
+        nearest_voxel_dist = float(np.min(point_clearances))
+        current_clearance = float(point_clearances[0])
+        path_distance = np.linalg.norm(pts - pts[0], axis=1)
+        outside_escape_segment = path_distance >= float(escape_distance)
+        escape_clearance = (
+            float(np.min(point_clearances[outside_escape_segment]))
+            if np.any(outside_escape_segment) else nearest_voxel_dist
+        )
+        escape_safe = (
+            allow_clearance_escape
+            and
+            current_clearance <= dist_threshold
+            and nearest_voxel_dist >= current_clearance - float(escape_tolerance)
+            and escape_clearance > dist_threshold
+            and float(point_clearances[-1]) > current_clearance
+        )
+        effective_clearance = escape_clearance if escape_safe else nearest_voxel_dist
+        clearances.append(float(effective_clearance))
+        if nearest_voxel_dist > dist_threshold or escape_safe:
             # the trajectory meets the dist_threshold criterion
             if goal_position is not None:
                 # the trajectory satisfies the dist_threshold; let's compute the goal score
@@ -340,6 +361,18 @@ def choose_primitive(
                     # we have found a trajectory that gets us closer to goal
                     max_traj_idx = traj_idx
                     max_traj_score = nearest_voxel_dist
+
+    if debug:
+        bounds = (
+            np.vstack((voxel_coords_numpy.min(axis=0), voxel_coords_numpy.max(axis=0))).round(3).tolist()
+            if len(voxel_coords_numpy) else []
+        )
+        print(
+            "PLANNER DEBUG: "
+            f"voxels={len(voxel_coords_numpy)} bounds={bounds} "
+            f"camera={camera_position[:3, 3].round(3).tolist()} "
+            f"clearances={np.asarray(clearances).round(3).tolist()}"
+        )
 
     if max_traj_idx is None:
         # No trajectory meets the dist_threshold criterion, crazyflie should stop.
@@ -426,6 +459,46 @@ def transform_image(image, mtx, dist, kinect):
     # Transform to the kinect camera matrix
     transformed_image = cv2.undistort(np.asarray(image), mtx, dist, None, kinect.intrinsic_matrix)
     return transformed_image
+
+
+def transform_depth_image(depth, mtx, dist, target_camera):
+    """Reproject metric depth without blending valid and invalid ranges.
+
+    Bilinear RGB warping invents intermediate metric depths at silhouettes
+    (especially between a valid surface and zero-valued sky). Those pixels
+    become floating TSDF surfaces, so depth must use nearest-neighbour maps.
+    """
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.shape[0] != target_camera.height or depth.shape[1] != target_camera.width:
+        scale_vec = np.array(
+            [
+                target_camera.width / depth.shape[1],
+                target_camera.height / depth.shape[0],
+                1.0,
+            ]
+        ).reshape((3, 1))
+        mtx = mtx * scale_vec
+        depth = cv2.resize(
+            depth,
+            (target_camera.width, target_camera.height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    map_x, map_y = cv2.initUndistortRectifyMap(
+        mtx,
+        dist,
+        None,
+        target_camera.intrinsic_matrix,
+        (target_camera.width, target_camera.height),
+        cv2.CV_32FC1,
+    )
+    return cv2.remap(
+        depth,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
 
 """
 Helper function to extract the image frame number from the filename string.
