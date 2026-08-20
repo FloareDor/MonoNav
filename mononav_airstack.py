@@ -152,6 +152,12 @@ def main():
         default=0.35,
         help="pause if camera altitude differs from its initial value by more than this (m)",
     )
+    parser.add_argument(
+        "--stop-confirm-frames",
+        type=int,
+        default=3,
+        help="end the mission only after this many consecutive frames have no safe primitive",
+    )
     args = parser.parse_args()
 
     config = load_config("config.yml")
@@ -195,6 +201,7 @@ def main():
     min_period = 1.0 / max(args.rate, 0.1)
     mission_complete = False
     pause_sent = False
+    unsafe_frame_count = 0
     stop_reason = ""
     flight_started = not args.wait_for_start
 
@@ -282,8 +289,15 @@ def main():
             transformed_lines[selected_index].paint_uniform_color([0.0, 1.0, 0.0])
             world_primitive = transform_primitive(trajectory_lines[selected_index], pose)
             if flight_started and should_stop:
-                mission_complete = True
-                stop_reason = f"no primitive satisfies {args.min_dist2obs:.2f} m clearance"
+                unsafe_frame_count += 1
+                if unsafe_frame_count >= args.stop_confirm_frames:
+                    mission_complete = True
+                    stop_reason = (
+                        f"no primitive satisfies {args.min_dist2obs:.2f} m clearance "
+                        f"for {unsafe_frame_count} consecutive frames"
+                    )
+            else:
+                unsafe_frame_count = 0
             if mission_complete and args.execute and not pause_sent:
                 print(
                     f"Mission stopping ({stop_reason}) at goal distance "
@@ -318,7 +332,8 @@ def main():
                 f"frame={fused_frames}  Zoe={inference_seconds * 1000:.0f} ms  "
                 f"primitive={selected_index}/{len(trajectory_lines)-1}  "
                 f"goal={distance_to_goal:.2f} m  clearance={args.min_dist2obs:.2f} m  "
-                f"TSDF={point_count} pts  stop={mission_complete}"
+                f"TSDF={point_count} pts  unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
+                f"stop={stop_reason if mission_complete else 'no'}"
             )
             cv2.putText(display_rgb, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
             if args.execute and not flight_started and not mission_complete:
