@@ -120,7 +120,8 @@ def create_visualizer():
     state = {
         "cloud": o3d.geometry.PointCloud(),
         "lines": [],
-        "geometries_added": False,
+        "cloud_added": False,
+        "lines_added": False,
         "view_initialized": False,
         "lookat": np.zeros(3),
     }
@@ -143,14 +144,12 @@ def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
     state["cloud"].points = point_cloud.points
     state["cloud"].colors = point_cloud.colors
     state["cloud"].normals = point_cloud.normals
-    if not state["geometries_added"]:
-        visualizer.add_geometry(state["cloud"], reset_bounding_box=False)
+    if not state["lines_added"]:
         state["lines"] = [copy.deepcopy(line) for line in trajectory_lines]
         for line in state["lines"]:
             visualizer.add_geometry(line, reset_bounding_box=False)
-        state["geometries_added"] = True
+        state["lines_added"] = True
     else:
-        visualizer.update_geometry(state["cloud"])
         for displayed, updated in zip(state["lines"], trajectory_lines):
             displayed.points = updated.points
             displayed.lines = updated.lines
@@ -158,11 +157,17 @@ def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
             visualizer.update_geometry(displayed)
 
     # The first few frames can be empty. Initialize the view only once a useful
-    # reconstruction exists, and never overwrite subsequent mouse adjustments.
+    # reconstruction exists. Open3D refuses to register an empty PointCloud, so
+    # adding it on frame zero and merely calling update_geometry later results in
+    # a permanently black window even though the TSDF itself is populated.
     if point_count >= 200 and not state["view_initialized"]:
+        visualizer.add_geometry(state["cloud"], reset_bounding_box=True)
+        state["cloud_added"] = True
         state["lookat"] = point_cloud.get_axis_aligned_bounding_box().get_center()
         set_default_view(visualizer, state["lookat"])
         state["view_initialized"] = True
+    elif state["cloud_added"]:
+        visualizer.update_geometry(state["cloud"])
     visualizer.poll_events()
     visualizer.update_renderer()
     return point_count
