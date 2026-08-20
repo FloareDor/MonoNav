@@ -213,6 +213,12 @@ def main():
         default=3,
         help="end the mission only after this many consecutive frames have no safe primitive",
     )
+    parser.add_argument(
+        "--planning-height-band",
+        type=float,
+        default=0.4,
+        help="collision-check TSDF voxels within this distance above/below the camera (m)",
+    )
     args = parser.parse_args()
 
     config = load_config("config.yml")
@@ -337,6 +343,9 @@ def main():
                         config["filterWeights"],
                         config["filterTSDF"],
                         config["weight_threshold"],
+                        2,  # AirStack map frame is Z-up.
+                        float(pose[2, 3]),
+                        args.planning_height_band,
                     )
                     if chosen is not None:
                         selected_index = chosen
@@ -361,6 +370,7 @@ def main():
                     f"{distance_to_goal:.2f} m: {post_pause(args.server)}"
                 )
                 pause_sent = True
+                flight_started = False
             execute_this_primitive = (
                 args.execute
                 and flight_started
@@ -390,13 +400,13 @@ def main():
                 f"primitive={selected_index}/{len(trajectory_lines)-1}  "
                 f"goal={distance_to_goal:.2f} m  clearance={args.min_dist2obs:.2f} m  "
                 f"TSDF={point_count} pts  unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
-                f"stop={stop_reason if mission_complete else 'no'}"
+                f"blocked={should_stop}  stop={stop_reason if mission_complete else 'no'}"
             )
             cv2.putText(display_rgb, status, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-            if args.execute and not flight_started and not mission_complete:
+            if args.execute and not flight_started:
                 cv2.putText(
                     display_rgb,
-                    "READY - click this window and press S or SPACE to fly",
+                    "READY - click here and press S/SPACE to fly or restart",
                     (12, 58),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.58,
@@ -409,7 +419,11 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if args.execute and not flight_started and not mission_complete and key in (ord("s"), ord(" ")):
+            if args.execute and not flight_started and key in (ord("s"), ord(" ")):
+                mission_complete = False
+                stop_reason = "running"
+                pause_sent = False
+                unsafe_frame_count = 0
                 flight_started = True
                 goal_position = (pose @ np.array([0.0, 0.0, args.goal_distance, 1.0]))[:3].reshape(1, 3)
                 initial_camera_altitude = float(pose[2, 3])
@@ -419,7 +433,8 @@ def main():
                 flight_started = False
             print(
                 f"frame={fused_frames} seq={last_sequence} primitive={selected_index} "
-                f"tsdf_points={point_count} zoe={inference_seconds:.3f}s bridge={response}",
+                f"tsdf_points={point_count} blocked={should_stop} "
+                f"zoe={inference_seconds:.3f}s bridge={response}",
                 flush=True,
             )
 

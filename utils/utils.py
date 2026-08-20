@@ -229,7 +229,10 @@ def get_traj_linesets(traj_list):
 """
 MonoNav Planner: Return the chosen trajectory index given the current position, current reconstruction, trajectory library, and goal position.
 """
-def choose_primitive(vbg, camera_position, traj_linesets, goal_position, dist_threshold, filterYvals, filterWeights, filterTSDF, weight_threshold):
+def choose_primitive(
+        vbg, camera_position, traj_linesets, goal_position, dist_threshold,
+        filterYvals, filterWeights, filterTSDF, weight_threshold,
+        vertical_axis=None, vertical_center=None, vertical_half_extent=None):
 
     # Boolean for stopping criteria
     shouldStop = False
@@ -248,7 +251,16 @@ def choose_primitive(vbg, camera_position, traj_linesets, goal_position, dist_th
 
     # Generate mask to filter out y values (vertical) (+y is DOWN)
     # This is useful to filter out the floor, and avoid obstacles in-plane
-    if filterYvals:
+    if vertical_axis is not None and vertical_half_extent is not None:
+        center = (
+            float(camera_position[vertical_axis, 3])
+            if vertical_center is None else float(vertical_center)
+        )
+        mask = (voxel_coords[:, vertical_axis] - center).abs() <= vertical_half_extent
+        voxel_coords = voxel_coords[mask]
+        weights = weights[mask]
+        tsdf = tsdf[mask]
+    elif filterYvals:
         mask = voxel_coords[:, 1] < -0.3
         # Apply mask to voxel_coords and weights
         voxel_coords = voxel_coords[mask]
