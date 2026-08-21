@@ -39,7 +39,7 @@ both PegasusSimulator and ZoeDepth.
 mkdir dsta_ws
 cd dsta_ws
 git clone --recursive -b eungchang/adv-ws2 git@github.com:castacks/AirStack.git
-git clone https://github.com/engcang/MonoNav.git
+git clone --recursive https://github.com/engcang/MonoNav.git
 ```
 
 Set up AirStack and obtain its images. Skip `install` when Docker and NVIDIA Container
