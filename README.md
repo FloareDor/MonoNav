@@ -81,16 +81,29 @@ ENABLE_LIDAR=false \
 ./airstack.sh up isaac-sim robot-desktop
 ```
 
-Wait for the ROS workspace build and AirStack bringup to finish. In the AirStack GUI,
-issue `Takeoff` and wait until the Iris is stably hovering.
+Wait for the ROS workspace build and AirStack bringup to finish. After the front camera
+and odometry begin updating, send the AirStack takeoff action and wait for a successful
+result before starting the bridge:
+
+```bash
+docker exec -it airstack-robot-desktop-1 bash -lc \
+  'sws && ros2 action send_goal --feedback \
+  /robot_1/tasks/takeoff \
+  task_msgs/action/TakeoffTask \
+  "{target_altitude_m: 1.2, velocity_m_s: 0.3}"'
+```
 
 Terminal 2 — launch the bridge with trajectory execution enabled:
 
 ```bash
 docker exec -it airstack-robot-desktop-1 bash -lc \
   'sws && ros2 launch mononav_bridge mononav_bridge.launch.xml \
+  mononav_bridge_max_frame_rate:=3.0 \
   mononav_bridge_execute_commands:=true'
 ```
+
+The legacy MonoNav bridge rate above is independent of the generic vision-planner
+bridge used by Collision-avoidance. MonoNav still requests frames at `1.0` Hz below.
 
 Terminal 3 — start the MonoNav worker:
 
