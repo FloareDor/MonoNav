@@ -2,6 +2,8 @@
 
 import argparse
 import copy
+import os
+from pathlib import Path
 import json
 import struct
 import time
@@ -349,6 +351,11 @@ def create_visualizer():
 def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
     point_cloud = vbg.extract_point_cloud(weight_threshold).cpu().to_legacy()
     point_count = len(point_cloud.points)
+    if os.environ.get('WS2_INFERENCE_DIR') and state is not None:
+        points=np.asarray(point_cloud.points)
+        state['preview_points']=points[::max(1,len(points)//6000)].copy()
+    if visualizer is None:
+        return point_count
 
     # Keep the same geometry objects registered with the renderer. Clearing and
     # re-adding them every fusion frame makes mouse navigation stutter and can
@@ -387,6 +394,9 @@ def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
 
 def pump_open3d_events(visualizer, duration):
     """Keep mouse navigation responsive while waiting for the next fusion tick."""
+    if visualizer is None:
+        time.sleep(max(0.0,duration))
+        return
     deadline = time.monotonic() + max(0.0, duration)
     while time.monotonic() < deadline:
         visualizer.poll_events()
@@ -396,6 +406,7 @@ def pump_open3d_events(visualizer, duration):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--headless',action='store_true',help='Run without OpenCV/Open3D windows')
     parser.add_argument("--server", default="http://airstack-robot-desktop-1:8765")
     parser.add_argument(
         "--depth-source",
@@ -460,6 +471,7 @@ def main():
         help="fuse and visualize immediately, but wait for S/Space in an OpenCV window before flight",
     )
     parser.add_argument("--goal-distance", type=float, default=8.0)
+    parser.add_argument('--goal-radius',type=float,default=None,help='Override configured goal completion radius (metres)')
     parser.add_argument("--velocity", type=float, default=0.4)
     parser.add_argument(
         "--command-hold-seconds",
@@ -535,8 +547,13 @@ def main():
         ),
     )
     args = parser.parse_args()
+    if args.headless and args.wait_for_start:
+        parser.error('--wait-for-start requires a GUI')
 
     config = load_config("config.yml")
+    if args.goal_radius is not None:
+        if not np.isfinite(args.goal_radius) or args.goal_radius<=0:parser.error('--goal-radius must be positive')
+        config['min_dist2goal']=args.goal_radius
     zoe = None
     if args.depth_source == "zoe":
         print("Loading ZoeDepth...")
@@ -561,16 +578,17 @@ def main():
     vbg_wrapper = make_vbg_wrapper()
     trajectory_list = get_trajlist(args.trajlib_dir)
     trajectory_lines, _, forward_speed, _ = get_traj_linesets(trajectory_list)
-    visualizer, visualizer_state = create_visualizer()
+    visualizer, visualizer_state = (None,{}) if args.headless else create_visualizer()
     rgb_window = "MonoNav - live AirStack RGB"
     depth_window = "MonoNav - live ZoeDepth"
     for window_name, left, top in (
         (rgb_window, 930, 40),
         (depth_window, 930, 450),
     ):
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 640, 360)
-        cv2.moveWindow(window_name, left, top)
+        if not args.headless:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 640, 360)
+            cv2.moveWindow(window_name, left, top)
     kinect = o3d.camera.PinholeCameraIntrinsic(
         o3d.camera.PinholeCameraIntrinsicParameters.PrimeSenseDefault
     )
@@ -625,8 +643,9 @@ def main():
                 time.sleep(1.0)
                 continue
             if metadata["sequence"] == last_sequence:
-                visualizer.poll_events()
-                visualizer.update_renderer()
+                if visualizer is not None:
+                    visualizer.poll_events()
+                    visualizer.update_renderer()
                 time.sleep(0.02)
                 continue
             last_sequence = metadata["sequence"]
@@ -936,9 +955,46 @@ def main():
                 else "Isaac Sim ground-truth depth"
             )
             cv2.putText(depth_colormap, depth_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.imshow(rgb_window, display_rgb)
-            cv2.imshow(depth_window, depth_colormap)
-            key = cv2.waitKey(1) & 0xFF
+            if not args.headless:
+                cv2.imshow(rgb_window, display_rgb)
+                cv2.imshow(depth_window, depth_colormap)
+            if os.environ.get('WS2_INFERENCE_DIR'):
+                # The same inference images as the desktop windows, plus actual
+                # TSDF points and candidate primitives projected onto world XY.
+                upper=np.hstack([cv2.resize(cv2.cvtColor(kinect_rgb,cv2.COLOR_RGB2BGR),(640,360)),cv2.resize(depth_colormap,(640,360))])
+                cv2.rectangle(upper,(0,0),(1279,34),(20,20,20),-1)
+                cv2.putText(upper,'RGB input',(12,25),cv2.FONT_HERSHEY_SIMPLEX,.7,(235,235,235),1)
+                cv2.putText(upper,depth_label,(652,25),cv2.FONT_HERSHEY_SIMPLEX,.7,(235,235,235),1)
+                lower=np.full((260,1280,3),24,dtype=np.uint8)
+                def project_xy(points):
+                    xy=(np.asarray(points)[:,:2]-pose[:2,3])*45
+                    return np.column_stack((xy[:,0]+320,145-xy[:,1])).astype(np.int32)
+                points=visualizer_state.get('preview_points',np.empty((0,3)))
+                if len(points):
+                    pixels=project_xy(points);valid=(pixels[:,0]>=0)&(pixels[:,0]<640)&(pixels[:,1]>=35)&(pixels[:,1]<260)
+                    lower[pixels[valid,1],pixels[valid,0]]=(130,130,130)
+                for idx,line in enumerate(transformed_lines):
+                    pts=project_xy(np.asarray(line.points))
+                    cv2.polylines(lower,[pts],False,(0,230,0) if idx==selected_index else (90,90,90),2 if idx==selected_index else 1)
+                cv2.circle(lower,(320,145),5,(255,255,255),-1)
+                cv2.putText(lower,'TSDF + candidate paths (XY top view)',(12,25),cv2.FONT_HERSHEY_SIMPLEX,.65,(230,230,230),1)
+                lines=[f'MonoNav | {args.depth_source} depth -> TSDF -> motion primitive',
+                       f'Chosen primitive: {selected_index}   Goal distance: {distance_to_goal:.2f} m',
+                       f'TSDF points: {point_count}   Map ready: {map_ready}',
+                       f'Inference: {inference_seconds*1000:.0f} ms   Frame: {fused_frames}',
+                       f'Blocked: {should_stop}   Recovery: {recovery_mode}']
+                for idx,label in enumerate(lines):cv2.putText(lower,label,(650,45+idx*40),cv2.FONT_HERSHEY_SIMPLEX,.55,(235,235,235),1)
+                directory=Path(os.environ['WS2_INFERENCE_DIR']);directory.mkdir(parents=True,exist_ok=True)
+                ok,encoded=cv2.imencode('.jpg',np.vstack([upper,lower]),[cv2.IMWRITE_JPEG_QUALITY,85])
+                if ok:
+                    temp=directory/'mononav.jpg.tmp';temp.write_bytes(encoded.tobytes());temp.replace(directory/'mononav.jpg')
+                    info={'planner':'mononav','run_id':os.environ.get('WS2_RUN_ID'),'wall_time':time.time(),
+                          'sequence':int(metadata['sequence']),'sim_stamp':metadata['stamp'],
+                          'inference_ms':inference_seconds*1000,'primitive':int(selected_index),
+                          'goal_distance':float(distance_to_goal),'tsdf_points':int(point_count),
+                          'blocked':bool(should_stop),'depth_source':args.depth_source}
+                    temp=directory/'mononav.json.tmp';temp.write_text(json.dumps(info));temp.replace(directory/'mononav.json')
+            key = -1 if args.headless else cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
             if args.execute and not flight_started and key in (ord("s"), ord(" ")):
@@ -975,7 +1031,8 @@ def main():
         if args.execute:
             print(f"Requesting hover: {post_pause(args.server)}")
         cv2.destroyAllWindows()
-        visualizer.destroy_window()
+        if visualizer is not None:
+            visualizer.destroy_window()
 
 
 if __name__ == "__main__":

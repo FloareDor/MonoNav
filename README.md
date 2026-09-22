@@ -4,6 +4,18 @@ Original repo: [natesimon/MonoNav](https://github.com/natesimon/MonoNav)
 
 ## AirStack online demo
 
+For unattended bench execution, `mononav_airstack.py --headless --execute`
+runs without OpenCV/Open3D windows. Do not combine `--headless` with
+`--wait-for-start`. `--goal-radius` overrides the configured completion radius
+so the worker and external evaluator can use the same mission definition.
+Each isolated trial starts a new worker to reset TSDF and recovery state.
+
+Optional `WS2_INFERENCE_DIR` exports the actual RGB/depth, TSDF projection and
+candidate/selected primitives as `mononav.jpg` plus `mononav.json`, including
+in headless mode. Mount a writable directory there and set `WS2_RUN_ID` to the
+trial identifier. The AirStack bench does this automatically for its web monitor.
+Only the most recent frame is retained; this does not record a video.
+
 This fork runs the MonoNav perception and motion-primitive planner online with an
 AirStack Iris in NVIDIA Isaac Sim. AirStack publishes the simulated left RGB image,
 camera intrinsics, and ground-truth optical-camera pose through a small ROS 2/HTTP
