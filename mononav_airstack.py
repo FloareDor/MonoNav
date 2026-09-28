@@ -522,6 +522,14 @@ def main():
         help="initial path length allowed to exit an already-inflated obstacle margin",
     )
     parser.add_argument("--recovery-yaw-deg", type=float, default=25.0)
+    parser.add_argument(
+        "--execute-extreme-primitives",
+        action="store_true",
+        help=(
+            "execute clearance-checked outermost trajectory primitives instead of "
+            "replacing them with a yaw-scan recovery"
+        ),
+    )
     parser.add_argument("--recovery-radius", type=float, default=0.03)
     parser.add_argument("--recovery-velocity", type=float, default=0.03)
     parser.add_argument(
@@ -846,7 +854,12 @@ def main():
                     print(f"UNSAFE HOLD: {post_pause(args.server)}")
                 if unsafe_frame_count >= args.stop_confirm_frames:
                     recovery_mode = "blocked yaw scan"
-            elif flight_started and map_ready and extreme_selected:
+            elif (
+                flight_started
+                and map_ready
+                and extreme_selected
+                and not args.execute_extreme_primitives
+            ):
                 unsafe_frame_count = 0
                 recovery_mode = "extreme-primitive yaw scan"
             else:
@@ -872,7 +885,7 @@ def main():
                 and fused_frames >= args.warmup_frames
                 and map_ready
                 and not should_stop
-                and not extreme_selected
+                and (args.execute_extreme_primitives or not extreme_selected)
                 and not mission_complete
             )
             if (
