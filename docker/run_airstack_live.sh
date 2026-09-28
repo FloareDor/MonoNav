@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/.." && pwd)"
-image_name="${MONONAV_DOCKER_IMAGE:-mononav-demo:1.0}"
+image_name="${MONONAV_DOCKER_IMAGE:-mononav-demo:2.7.1-cu128}"
 network_name="${AIRSTACK_DOCKER_NETWORK:-airstack_airstack_network}"
 server_url="${MONONAV_AIRSTACK_SERVER:-http://airstack-robot-desktop-1:8765}"
 

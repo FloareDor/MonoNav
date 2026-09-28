@@ -1,4 +1,6 @@
-FROM pytorch/pytorch:1.13.1-cuda11.6-cudnn8-runtime
+# PyTorch CUDA 12.8 wheels include Blackwell (sm_120) kernels. The previous
+# CUDA 11.6 base cannot run MonoNav on OSMO's RTX PRO 5000 Blackwell GPUs.
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -17,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir \
-    h5py==3.7.0 \
+    h5py==3.10.0 \
     huggingface-hub==0.11.1 \
     matplotlib==3.6.2 \
     numpy==1.24.1 \
@@ -26,7 +28,7 @@ RUN python -m pip install --no-cache-dir \
     Pillow==9.4.0 \
     PyYAML==6.0.1 \
     scipy==1.10.0 \
-    timm==0.6.12 \
+    timm==0.6.13 \
     tqdm==4.64.1 \
     trimesh==3.22.1 \
     cflib==0.1.23

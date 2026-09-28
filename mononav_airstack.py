@@ -392,6 +392,15 @@ def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
     return point_count
 
 
+def planning_voxel_count(vbg, weight_threshold):
+    """Count the weighted negative-TSDF voxels used by choose_primitive."""
+    weights = vbg.attribute("weight").reshape((-1))
+    tsdf = vbg.attribute("tsdf").reshape((-1))
+    _, voxel_indices = vbg.voxel_coordinates_and_flattened_indices()
+    mask = (weights[voxel_indices] > weight_threshold) & (tsdf[voxel_indices] < 0.0)
+    return int(np.count_nonzero(mask.cpu().numpy()))
+
+
 def pump_open3d_events(visualizer, duration):
     """Keep mouse navigation responsive while waiting for the next fusion tick."""
     if visualizer is None:
@@ -535,6 +544,16 @@ def main():
         help="retain only TSDF voxel blocks within this 3D radius of the camera (m)",
     )
     parser.add_argument(
+        "--tsdf-device",
+        choices=("CPU:0", "CUDA:0"),
+        help="override the Open3D voxel-grid device without changing ZoeDepth's device",
+    )
+    parser.add_argument(
+        "--tsdf-weight-threshold",
+        type=float,
+        help="override the minimum integrated TSDF weight used for planning",
+    )
+    parser.add_argument(
         "--tsdf-block-warning",
         "--max-tsdf-blocks",
         dest="tsdf_block_warning",
@@ -554,6 +573,10 @@ def main():
     if args.goal_radius is not None:
         if not np.isfinite(args.goal_radius) or args.goal_radius<=0:parser.error('--goal-radius must be positive')
         config['min_dist2goal']=args.goal_radius
+    if args.tsdf_weight_threshold is not None and (
+        not np.isfinite(args.tsdf_weight_threshold) or args.tsdf_weight_threshold < 0
+    ):
+        parser.error('--tsdf-weight-threshold must be non-negative')
     zoe = None
     if args.depth_source == "zoe":
         print("Loading ZoeDepth...")
@@ -567,12 +590,18 @@ def main():
         print("Using Isaac Sim ground-truth metric depth (ZoeDepth bypassed)")
 
     settings = config["VoxelBlockGrid"]
+    tsdf_device = args.tsdf_device or settings["device"]
+    tsdf_weight_threshold = (
+        args.tsdf_weight_threshold
+        if args.tsdf_weight_threshold is not None
+        else config["weight_threshold"]
+    )
     def make_vbg_wrapper():
         return VoxelBlockGrid(
             settings["depth_scale"],
             settings["depth_max"],
             settings["trunc_voxel_multiplier"],
-            o3d.core.Device(settings["device"]),
+            o3d.core.Device(tsdf_device),
         )
 
     vbg_wrapper = make_vbg_wrapper()
@@ -743,6 +772,9 @@ def main():
             vbg_wrapper.integration_step(
                 cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR), depth_mm, pose
             )
+            point_count = planning_voxel_count(
+                vbg_wrapper.vbg, tsdf_weight_threshold
+            )
             tsdf_block_count, pruned_blocks = vbg_wrapper.prune_outside_radius(
                 pose[:3, 3], args.tsdf_local_radius
             )
@@ -784,7 +816,7 @@ def main():
                         False,  # TSDF is in AirStack map coordinates; Y is not camera-down.
                         config["filterWeights"],
                         config["filterTSDF"],
-                        config["weight_threshold"],
+                        tsdf_weight_threshold,
                         2,  # AirStack map frame is Z-up.
                         float(pose[2, 3]),
                         args.planning_height_band,
@@ -918,11 +950,11 @@ def main():
                         False,
                     )
 
-            point_count = update_open3d(
+            update_open3d(
                 visualizer,
                 visualizer_state,
                 vbg_wrapper.vbg,
-                config["weight_threshold"],
+                tsdf_weight_threshold,
                 transformed_lines,
             )
 
