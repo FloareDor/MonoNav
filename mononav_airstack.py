@@ -349,6 +349,13 @@ def create_visualizer():
 
 
 def update_open3d(visualizer, state, vbg, weight_threshold, trajectory_lines):
+    if int(vbg.hashmap().active_buf_indices().shape[0]) == 0:
+        if os.environ.get("WS2_INFERENCE_DIR") and state is not None:
+            state["preview_points"] = np.empty((0, 3))
+        if visualizer is not None:
+            visualizer.poll_events()
+            visualizer.update_renderer()
+        return 0
     point_cloud = vbg.extract_point_cloud(weight_threshold).cpu().to_legacy()
     point_count = len(point_cloud.points)
     if os.environ.get('WS2_INFERENCE_DIR') and state is not None:
