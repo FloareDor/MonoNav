@@ -187,6 +187,51 @@ def filter_isolated_near_depth(
     )
 
 
+def detect_degenerate_zoe_depth(
+    rgb,
+    depth_mm,
+    min_correspondence=0.12,
+    edge_percentile=85.0,
+    min_edge_pixels=300,
+    correspondence_dilate_px=2,
+):
+    """Flag a ZoeDepth frame whose structure doesn't match the RGB it came from.
+
+    Observed failure mode: ZoeDepth occasionally outputs a near-uniform,
+    banded gradient with no correspondence to a clearly-textured scene (e.g.
+    a close column/plant). The planner's own `blocked` check then reads this
+    wrong-but-smooth depth as clear and drives through the real obstacle.
+    Real depth frames have edges wherever the RGB frame has strong object
+    boundaries; a degenerate frame does not. A frame with few RGB edges
+    (looking at a blank wall/corridor) is not evaluated, since there is
+    nothing to corroborate either way.
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    rgb_gradient = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    edge_threshold = np.percentile(rgb_gradient, edge_percentile)
+    strong_rgb_edges = rgb_gradient > max(edge_threshold, 1e-3)
+    strong_edge_pixels = int(np.count_nonzero(strong_rgb_edges))
+    if strong_edge_pixels < min_edge_pixels:
+        return False, strong_edge_pixels, 1.0
+
+    depth = depth_mm.astype(np.float32)
+    depth_gradient = cv2.magnitude(
+        cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    depth_edge_threshold = max(float(np.percentile(depth_gradient, edge_percentile)), 1e-3)
+    depth_edges = (depth_gradient > depth_edge_threshold).astype(np.uint8)
+    kernel = np.ones((2 * correspondence_dilate_px + 1, 2 * correspondence_dilate_px + 1), np.uint8)
+    depth_edges_dilated = cv2.dilate(depth_edges, kernel) > 0
+
+    corresponded = int(np.count_nonzero(strong_rgb_edges & depth_edges_dilated))
+    correspondence = corresponded / float(strong_edge_pixels)
+    return correspondence < min_correspondence, strong_edge_pixels, correspondence
+
+
 def reproject_depth_to_camera(depth_mm, source_pose, target_pose, intrinsic):
     """Z-buffer a prior metric depth image into the current optical camera."""
     depth = np.asarray(depth_mm, dtype=np.float32) / 1000.0
@@ -471,6 +516,26 @@ def main():
         type=int,
         default=200,
         help="maximum sudden-near component area to reject; 0 disables the gate",
+    )
+    parser.add_argument(
+        "--zoe-degenerate-min-correspondence",
+        type=float,
+        default=0.12,
+        help=(
+            "minimum fraction of strong RGB edges that must have a matching "
+            "depth edge; below this the frame is treated as a degenerate Zoe "
+            "readout and skipped (not fused, forced unsafe). 0 disables the check"
+        ),
+    )
+    parser.add_argument(
+        "--max-unmapped-gap",
+        type=float,
+        default=0.35,
+        help=(
+            "treat a candidate trajectory point as unmapped (not confirmed "
+            "clear) if no TSDF voxel has been observed within this distance "
+            "of it (m); 0 disables the check"
+        ),
     )
     parser.add_argument("--planner-debug", action="store_true")
     parser.add_argument(
@@ -763,14 +828,29 @@ def main():
                         args.zoe_temporal_near_relative,
                         args.zoe_temporal_max_component,
                     )
-                previous_zoe_depth_mm = depth_mm.copy()
-                previous_zoe_pose = pose.copy()
+                depth_degenerate, zoe_edge_pixels, zoe_edge_correspondence = (
+                    detect_degenerate_zoe_depth(
+                        kinect_rgb, depth_mm, args.zoe_degenerate_min_correspondence
+                    )
+                    if args.zoe_degenerate_min_correspondence > 0
+                    else (False, 0, 1.0)
+                )
+                if depth_degenerate:
+                    print(
+                        "DEGENERATE DEPTH: Zoe frame doesn't match RGB structure "
+                        f"(edge_correspondence={zoe_edge_correspondence:.2f} over "
+                        f"{zoe_edge_pixels} strong RGB edges) -- not fused, forced unsafe"
+                    )
+                else:
+                    previous_zoe_depth_mm = depth_mm.copy()
+                    previous_zoe_pose = pose.copy()
                 depth_colormap = cv2.applyColorMap(
                     cv2.convertScaleAbs(depth_mm, alpha=0.03), cv2.COLORMAP_JET
                 )
             else:
                 spatial_speckle_pixels = 0
                 temporal_speckle_pixels = 0
+                depth_degenerate = False
                 source_depth_m = transform_depth_image(
                     source_depth_m, source_intrinsic, zero_distortion, kinect
                 )
@@ -784,9 +864,10 @@ def main():
                     source_depth_m, settings["depth_max"]
                 )
             inference_seconds = time.monotonic() - inference_start
-            vbg_wrapper.integration_step(
-                cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR), depth_mm, pose
-            )
+            if not depth_degenerate:
+                vbg_wrapper.integration_step(
+                    cv2.cvtColor(kinect_rgb, cv2.COLOR_RGB2BGR), depth_mm, pose
+                )
             point_count = planning_voxel_count(
                 vbg_wrapper.vbg, tsdf_weight_threshold
             )
@@ -838,11 +919,19 @@ def main():
                         args.planner_debug,
                         True,  # AirStack-only recovery from an inflated-margin start.
                         args.clearance_recovery_distance,
+                        max_unmapped_gap=(
+                            args.max_unmapped_gap if args.max_unmapped_gap > 0 else None
+                        ),
                     )
                     if chosen is not None:
                         selected_index = chosen
                 except (ValueError, RuntimeError) as exc:
                     print(f"Planner waiting for a usable reconstruction: {exc}")
+            if depth_degenerate:
+                # Perception for this frame is untrustworthy -- never trust a
+                # "clear" reading from it, regardless of what the planner saw
+                # in the (unpoisoned, not-yet-updated) map.
+                should_stop = True
 
             transformed_lines[selected_index].paint_uniform_color([0.0, 1.0, 0.0])
             world_primitive = transform_execution_primitive(
@@ -986,6 +1075,7 @@ def main():
                 f"TSDF={point_count}/{args.min_tsdf_points} pts  map_ready={map_ready}  "
                 f"blocks={tsdf_block_count}  "
                 f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels}  "
+                f"depth_ok={not depth_degenerate}  "
                 f"unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
                 f"blocked={should_stop}  recovery={recovery_mode}  "
                 f"stop={stop_reason if mission_complete else 'no'}"
@@ -1071,7 +1161,7 @@ def main():
             print(
                 f"frame={fused_frames} seq={last_sequence} primitive={selected_index} "
                 f"tsdf_points={point_count} tsdf_blocks={tsdf_block_count} blocked={should_stop} "
-                f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels} "
+                f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels} depth_ok={not depth_degenerate} "
                 f"zoe={inference_seconds:.3f}s bridge={response}",
                 flush=True,
             )

@@ -257,7 +257,7 @@ def choose_primitive(
         filterYvals, filterWeights, filterTSDF, weight_threshold,
         vertical_axis=None, vertical_center=None, vertical_half_extent=None,
         debug=False, allow_clearance_escape=False, escape_distance=0.25,
-        escape_tolerance=0.05):
+        escape_tolerance=0.05, max_unmapped_gap=None):
 
     # Boolean for stopping criteria
     shouldStop = False
@@ -299,6 +299,18 @@ def choose_primitive(
         # Apply mask to voxel_coords and weights
         voxel_coords = voxel_coords[mask,:]
         tsdf = tsdf[mask]
+
+    # Snapshot of every voxel this pass has actually observed (either side of
+    # the TSDF surface), taken before the obstacle-only filter below narrows
+    # voxel_coords. A trajectory point with no observed voxel anywhere near it
+    # has no TSDF record at all -- it was never integrated, or its block was
+    # pruned by the sliding window -- and must not be scored as confirmed-clear
+    # just because the (empty) obstacle tree has nothing nearby either.
+    if max_unmapped_gap is not None and max_unmapped_gap > 0:
+        known_coords_numpy = voxel_coords.cpu().numpy()
+        known_tree = cKDTree(known_coords_numpy) if len(known_coords_numpy) else None
+    else:
+        known_tree = None
 
     # Generate mask to filter by tsdf value
     if filterTSDF:
@@ -345,7 +357,12 @@ def choose_primitive(
         )
         effective_clearance = escape_clearance if escape_safe else nearest_voxel_dist
         clearances.append(float(effective_clearance))
-        if nearest_voxel_dist > dist_threshold or escape_safe:
+        if known_tree is not None:
+            known_point_dist = known_tree.query(pts, k=1)[0]
+            unmapped = bool(np.any(known_point_dist > max_unmapped_gap))
+        else:
+            unmapped = False
+        if (nearest_voxel_dist > dist_threshold or escape_safe) and not unmapped:
             # the trajectory meets the dist_threshold criterion
             if goal_position is not None:
                 # the trajectory satisfies the dist_threshold; let's compute the goal score
