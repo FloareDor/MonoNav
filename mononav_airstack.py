@@ -1080,7 +1080,7 @@ def main():
                 f"TSDF={point_count}/{args.min_tsdf_points} pts  map_ready={map_ready}  "
                 f"blocks={tsdf_block_count}  "
                 f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels}  "
-                f"depth_ok={not depth_degenerate}  "
+                f"depth_ok={not depth_degenerate}({zoe_edge_correspondence:.2f})  "
                 f"unsafe={unsafe_frame_count}/{args.stop_confirm_frames}  "
                 f"blocked={should_stop}  recovery={recovery_mode}  "
                 f"stop={stop_reason if mission_complete else 'no'}"
@@ -1167,6 +1167,12 @@ def main():
                 f"frame={fused_frames} seq={last_sequence} primitive={selected_index} "
                 f"tsdf_points={point_count} tsdf_blocks={tsdf_block_count} blocked={should_stop} "
                 f"speckles={spatial_speckle_pixels}/{temporal_speckle_pixels} depth_ok={not depth_degenerate} "
+                # The correspondence value, not just the verdict. The gate has
+                # never been observed firing, and without the number there is no
+                # way to tell whether frames sit just above the threshold or
+                # nowhere near it.
+                f"zoe_corr={zoe_edge_correspondence:.3f}/{args.zoe_degenerate_min_correspondence:.3f} "
+                f"zoe_edges={zoe_edge_pixels} "
                 f"zoe={inference_seconds:.3f}s bridge={response}",
                 flush=True,
             )
