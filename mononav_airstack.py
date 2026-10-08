@@ -530,11 +530,16 @@ def main():
     parser.add_argument(
         "--max-unmapped-gap",
         type=float,
-        default=0.35,
+        default=0.0,
         help=(
             "treat a candidate trajectory point as unmapped (not confirmed "
             "clear) if no TSDF voxel has been observed within this distance "
-            "of it (m); 0 disables the check"
+            "of it (m); 0 disables the check. Off by default: Open3D allocates "
+            "blocks only in the +/-trunc band around an observed surface, so "
+            "'a voxel within the gap' means 'close to a surface', and enabling "
+            "this rejects the open centre of a corridor for being open. It "
+            "grounded the planner at under 0.3 m travelled in the 2026-10-08 "
+            "A/B. Observation needs a frustum/depth test, not a voxel distance."
         ),
     )
     parser.add_argument("--planner-debug", action="store_true")
